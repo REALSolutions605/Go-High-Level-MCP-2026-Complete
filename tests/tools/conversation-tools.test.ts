@@ -17,20 +17,19 @@ describe('ConversationTools', () => {
   });
 
   describe('getToolDefinitions', () => {
-    it('should return 7 conversation tool definitions', () => {
+    it('should return 20 conversation tool definitions', () => {
       const tools = conversationTools.getToolDefinitions();
-      expect(tools).toHaveLength(7);
+      expect(tools).toHaveLength(20);
       
       const toolNames = tools.map(tool => tool.name);
-      expect(toolNames).toEqual([
-        'send_sms',
-        'send_email',
-        'search_conversations',
-        'get_conversation',
-        'create_conversation',
-        'update_conversation',
-        'get_recent_messages'
-      ]);
+      // Verify the original 7 tools are present plus the new ones
+      expect(toolNames).toContain('send_sms');
+      expect(toolNames).toContain('send_email');
+      expect(toolNames).toContain('search_conversations');
+      expect(toolNames).toContain('get_conversation');
+      expect(toolNames).toContain('create_conversation');
+      expect(toolNames).toContain('update_conversation');
+      expect(toolNames).toContain('get_recent_messages');
     });
 
     it('should have proper schema definitions for all tools', () => {
