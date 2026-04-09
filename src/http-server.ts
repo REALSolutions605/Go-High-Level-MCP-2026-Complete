@@ -79,6 +79,21 @@ class GHLMCPHttpServer {
 
     this.app.use(express.json());
 
+    const BEARER_TOKEN = process.env.MCP_BEARER_TOKEN;
+
+    this.app.use((req, res, next) => {
+      if(!BEARER_TOKEN) return next();
+
+      const auth = req.headers['authorization'];
+
+      if(!auth || auth !== `Bearer ${BEARER_TOKEN}`){
+        res.status(401).json({ error: 'Unauthorized' });
+        return;
+      }
+
+      next();
+    }
+
     this.app.use((req, _res, next) => {
       console.log(`[HTTP] ${req.method} ${req.path} - ${new Date().toISOString()}`);
       next();
