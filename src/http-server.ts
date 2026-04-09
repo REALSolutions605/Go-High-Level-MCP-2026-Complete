@@ -92,7 +92,7 @@ class GHLMCPHttpServer {
       }
 
       next();
-    }
+    });
 
     this.app.use((req, _res, next) => {
       console.log(`[HTTP] ${req.method} ${req.path} - ${new Date().toISOString()}`);
