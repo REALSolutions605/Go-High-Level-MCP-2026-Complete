@@ -158,6 +158,18 @@ async function main() {
 
   app.use(express.json());
 
+  // Bearer token auth
+const BEARER_TOKEN = process.env.MCP_BEARER_TOKEN;
+app.use((req, res, next) => {
+  if (!BEARER_TOKEN) return next();
+  const auth = req.headers['authorization'];
+  if (!auth || auth !== `Bearer ${BEARER_TOKEN}`) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+  next();
+});
+
   // Request logging middleware
   app.use((req, _res, next) => {
     log('debug', `${req.method} ${req.path}`, { ip: req.ip });
