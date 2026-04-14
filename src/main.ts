@@ -24,6 +24,9 @@ import { MCPAppsManager } from './apps/index.js';
 import { GHLConfig } from './types/ghl-types.js';
 import { registerExecuteRoutes } from './execute-route.js';
 
+import { randomUUID } from 'node:crypto';
+import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
+
 dotenv.config();
 
 // ─── Structured Logger ──────────────────────────────────────
@@ -247,9 +250,6 @@ app.get("/.well-known/oauth-protected-resource/mcp", (req, res) => {
     scopes_supported: []
   });
 });
-
-  import { randomUUID } from 'node:crypto';
-import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 
 // Map of sessionId -> { transport, server }
 const sessions: Record<string, { transport: StreamableHTTPServerTransport; server: McpServer }> = {};
