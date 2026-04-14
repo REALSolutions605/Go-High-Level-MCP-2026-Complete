@@ -229,6 +229,25 @@ app.use((req, res, next) => {
     return srv;
   }
 
+  app.get("/.well-known/oauth-protected-resource", (req, res) => {
+  res.json({
+    resource: "https://ghlmcp.real-solutions-llc.com/mcp",
+    authorization_servers: [],
+    bearer_methods_supported: ["header"],
+    scopes_supported: []
+  });
+});
+
+// Some clients also probe with the path appended
+app.get("/.well-known/oauth-protected-resource/mcp", (req, res) => {
+  res.json({
+    resource: "https://ghlmcp.real-solutions-llc.com/mcp",
+    authorization_servers: [],
+    bearer_methods_supported: ["header"],
+    scopes_supported: []
+  });
+});
+
   app.all('/mcp', async (req, res) => {
     try {
       const transport = new StreamableHTTPServerTransport({
