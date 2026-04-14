@@ -248,15 +248,35 @@ app.get("/.well-known/oauth-protected-resource/mcp", (req, res) => {
   });
 });
 
-  app.all('/mcp', async (req, res) => {
-    try {
+  import { randomUUID } from 'node:crypto';
+import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
+
+// Map of sessionId -> { transport, server }
+const sessions: Record<string, { transport: StreamableHTTPServerTransport; server: McpServer }> = {};
+
+app.post('/mcp', async (req, res) => {
+  try {
+    const sessionId = req.headers['mcp-session-id'] as string | undefined;
+    let entry = sessionId ? sessions[sessionId] : undefined;
+
+    if (!entry && isInitializeRequest(req.body)) {
+      // New session — create transport + server
       const transport = new StreamableHTTPServerTransport({
-        sessionIdGenerator: undefined, // stateless
+        sessionIdGenerator: () => randomUUID(),
+        onsessioninitialized: (sid) => {
+          sessions[sid] = { transport, server };
+          log('info', 'MCP session initialized', { sessionId: sid });
+        },
       });
 
-      // Per-request GHL client — use credentials from request headers when
-      // provided (multi-tenant: each CRESyncFlow user brings their own creds).
-      // Falls back to the global env-level client if headers are absent.
+      transport.onclose = () => {
+        if (transport.sessionId) {
+          delete sessions[transport.sessionId];
+          log('info', 'MCP session closed', { sessionId: transport.sessionId });
+        }
+      };
+
+      // Per-request GHL credentials (your existing logic)
       const reqAccessToken = req.headers['x-ghl-access-token'] as string | undefined;
       const reqLocationId  = req.headers['x-ghl-location-id']  as string | undefined;
       let perRequestClient: EnhancedGHLClient | undefined;
@@ -267,22 +287,51 @@ app.get("/.well-known/oauth-protected-resource/mcp", (req, res) => {
           version: '2021-07-28',
           locationId: reqLocationId,
         });
-        log('debug', 'Using per-request GHL credentials', { locationId: reqLocationId });
       }
 
       const server = createFreshServer(perRequestClient);
+      await server.connect(transport);
       await transport.handleRequest(req, res, req.body);
-      // Clean up after the response finishes
-      res.on('close', () => {
-        server.close().catch(() => {});
-      });
-    } catch (err: any) {
-      log('error', 'Streamable HTTP error', { error: err.message });
-      if (!res.headersSent) {
-        res.status(500).json({ error: 'Internal server error' });
-      }
+      return;
     }
-  });
+
+    if (!entry) {
+      res.status(400).json({
+        jsonrpc: '2.0',
+        error: { code: -32000, message: 'No valid session — send initialize first' },
+        id: null,
+      });
+      return;
+    }
+
+    await entry.transport.handleRequest(req, res, req.body);
+  } catch (err: any) {
+    log('error', 'Streamable HTTP error', { error: err.message });
+    if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// GET /mcp — server-to-client notifications stream
+app.get('/mcp', async (req, res) => {
+  const sessionId = req.headers['mcp-session-id'] as string | undefined;
+  const entry = sessionId ? sessions[sessionId] : undefined;
+  if (!entry) {
+    res.status(400).send('Invalid or missing session ID');
+    return;
+  }
+  await entry.transport.handleRequest(req, res);
+});
+
+// DELETE /mcp — client-initiated session termination
+app.delete('/mcp', async (req, res) => {
+  const sessionId = req.headers['mcp-session-id'] as string | undefined;
+  const entry = sessionId ? sessions[sessionId] : undefined;
+  if (!entry) {
+    res.status(400).send('Invalid or missing session ID');
+    return;
+  }
+  await entry.transport.handleRequest(req, res);
+});
 
   // ── 6. Legacy SSE Endpoint ───────────────────────────────
   // Keep SSE for backward compatibility with older clients
