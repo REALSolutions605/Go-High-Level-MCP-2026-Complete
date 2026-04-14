@@ -143,20 +143,7 @@ async function main() {
 
   app.use(
     cors({
-      origin: (origin, callback) => {
-        if (!origin) return callback(null, true);
-        if (
-          /^https?:\/\/localhost(:\d+)?$/.test(origin) ||
-          origin === "https://chatgpt.com" ||
-          origin === "https://chat.openai.com" ||
-          origin === "https://claude.ai" ||
-          origin === "https://cowork.anthropic.com" ||
-          /^https?:\/\/.*\.anthropic\.com$/.test(origin)
-        ) {
-          return callback(null, true);
-        }
-        callback(new Error("CORS not allowed"));
-      },
+      origin: true,
       methods: ["GET", "POST", "DELETE", "OPTIONS"],
       allowedHeaders: [
         "Content-Type",
