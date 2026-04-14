@@ -141,21 +141,21 @@ async function main() {
   // ── 4. Express App ───────────────────────────────────────
   const app = express();
 
-  app.use(
-    cors({
-      origin: true,
-      methods: ["GET", "POST", "DELETE", "OPTIONS"],
-      allowedHeaders: [
-        "Content-Type",
-        "Authorization",
-        "Accept",
-        "mcp-session-id",
-        "x-ghl-access-token",
-        "x-ghl-location-id",
-      ],
-      credentials: true,
-    }),
-  );
+  app.use(cors({
+  origin: "*", // or restrict to Claude's origins
+  methods: ["GET", "POST", "OPTIONS", "DELETE"],
+  allowedHeaders: [
+    "Content-Type",
+    "Authorization",
+    "Mcp-Session-Id",
+    "mcp-protocol-version",
+    "x-ghl-access-token",
+    "x-ghl-location-id",
+    "Accept"
+  ],
+  exposedHeaders: ["Mcp-Session-Id", "mcp-protocol-version"],
+  credentials: false,
+}));
 
   app.use(express.json());
 
