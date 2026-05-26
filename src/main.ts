@@ -24,6 +24,7 @@ import { ToolRegistry } from './tool-registry.js';
 import { MCPAppsManager } from './apps/index.js';
 import { GHLConfig } from './types/ghl-types.js';
 import { registerExecuteRoutes } from './execute-route.js';
+import { registerPAERoutes } from './pae-handler.js';
 
 import { randomUUID } from 'node:crypto';
 import {
@@ -168,6 +169,11 @@ async function main() {
 }));
 
   app.use(express.json());
+
+  // ── PAE Webhook Endpoint (registered before bearer-token guard) ──────────
+  // GHL Custom Webhook action calls POST /pae/analyze with deal data JSON.
+  // Uses its own x-pae-secret header auth (PAE_WEBHOOK_SECRET env var).
+  registerPAERoutes(app, log);
 
   // Bearer token auth
 const BEARER_TOKEN = process.env.MCP_BEARER_TOKEN;
