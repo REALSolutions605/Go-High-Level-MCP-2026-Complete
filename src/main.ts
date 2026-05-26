@@ -77,13 +77,13 @@ async function main() {
 
   const ghlClient = new EnhancedGHLClient(config);
 
-  // Test connection
+  // Test connection (non-fatal — a 401 here can be a Private Integration token
+  // that is valid for read/write operations but not the specific probe endpoint)
   try {
     await ghlClient.testConnection();
     log('info', 'GHL API connection verified');
   } catch (err: any) {
-    log('error', 'GHL API connection failed', { error: err.message });
-    throw err;
+    log('warn', 'GHL API connection probe failed — continuing startup (token may still be valid)', { error: err.message });
   }
 
   // ── 2. Create McpServer ──────────────────────────────────
