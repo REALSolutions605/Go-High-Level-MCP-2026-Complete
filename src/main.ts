@@ -15,6 +15,7 @@ import cors from 'cors';
 import * as dotenv from 'dotenv';
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 
@@ -25,7 +26,13 @@ import { GHLConfig } from './types/ghl-types.js';
 import { registerExecuteRoutes } from './execute-route.js';
 
 import { randomUUID } from 'node:crypto';
-import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
+import {
+  isInitializeRequest,
+  ListToolsRequestSchema,
+  CallToolRequestSchema,
+  ErrorCode,
+  McpError,
+} from '@modelcontextprotocol/sdk/types.js';
 
 dotenv.config();
 
@@ -189,46 +196,41 @@ app.use((req, res, next) => {
   // Helper: register all tools on a fresh McpServer
   // Pass a clientOverride to use per-request GHL credentials instead of the
   // global env-level credentials (needed for multi-tenant deployments).
-  function createFreshServer(clientOverride?: EnhancedGHLClient): McpServer {
-    const srv = new McpServer(
+  function createFreshServer(clientOverride?: EnhancedGHLClient): Server {
+    const srv = new Server(
       { name: 'ghl-mcp-server', version: '2.0.0' },
       { capabilities: { tools: {} } }
     );
     const reg = new ToolRegistry(clientOverride ?? ghlClient);
-    reg.registerAll(srv);
     const regNames = new Set(reg.getAllToolNames());
-    for (const tool of appTools) {
-      if (regNames.has(tool.name)) continue;
-      const meta = (tool as any)._meta;
-      srv.registerTool(
-        tool.name,
-        {
-          title: tool.name.replace(/_/g, ' ').replace(/\b\w/g, (c: string) => c.toUpperCase()),
-          description: tool.description || '',
-          annotations: {
-            readOnlyHint: tool.name.startsWith('view_'),
-            destructiveHint: false,
-            idempotentHint: tool.name.startsWith('view_'),
-            openWorldHint: true,
-          },
-          _meta: meta,
-        },
-        async (args: any) => {
-          try {
-            const result = await appsManager.executeTool(tool.name, args || {});
-            return {
-              content: result.content || [{ type: 'text' as const, text: JSON.stringify(result) }],
-              structuredContent: result.structuredContent,
-            };
-          } catch (err: any) {
-            return {
-              content: [{ type: 'text' as const, text: `Error: ${err.message}` }],
-              isError: true,
-            };
-          }
+    const filteredAppTools = appTools.filter((t: any) => !regNames.has(t.name));
+    const allToolDefs = reg.getAllToolDefinitions(filteredAppTools);
+
+    srv.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: allToolDefs }));
+    srv.setRequestHandler(CallToolRequestSchema, async (request) => {
+      const { name, arguments: args } = request.params;
+      try {
+        const result = await reg.callTool(name, args || {});
+        if (result !== undefined) {
+          const text = typeof result === 'string' ? result : JSON.stringify(result, null, 2);
+          return { content: [{ type: 'text' as const, text }] };
         }
-      );
-    }
+        if (appsManager.isAppTool(name)) {
+          const appResult = await appsManager.executeTool(name, args || {});
+          return {
+            content: appResult.content || [{ type: 'text' as const, text: JSON.stringify(appResult) }],
+            structuredContent: appResult.structuredContent,
+          };
+        }
+        throw new McpError(ErrorCode.MethodNotFound, `Tool ${name} not found`);
+      } catch (err: any) {
+        if (err instanceof McpError) throw err;
+        return {
+          content: [{ type: 'text' as const, text: `Error executing ${name}: ${err.message}` }],
+          isError: true,
+        };
+      }
+    });
     return srv;
   }
 
@@ -252,7 +254,7 @@ app.get("/.well-known/oauth-protected-resource/mcp", (req, res) => {
 });
 
 // Map of sessionId -> { transport, server }
-const sessions: Record<string, { transport: StreamableHTTPServerTransport; server: McpServer }> = {};
+const sessions: Record<string, { transport: StreamableHTTPServerTransport; server: Server }> = {};
 
 app.post('/mcp', async (req, res) => {
   try {
@@ -340,51 +342,43 @@ app.delete('/mcp', async (req, res) => {
     log('info', 'SSE connection', { sessionId: String(sessionId) });
 
     try {
-      // Create a fresh McpServer + SSE transport per connection
+      // Create a fresh Server + SSE transport per connection
       // because SSE transport is stateful (one connection = one transport)
-      const sseServer = new McpServer(
+      const sseServer = new Server(
         { name: 'ghl-mcp-server', version: '2.0.0' },
         { capabilities: { tools: {} } }
       );
 
-      // Re-register all tools for this SSE session
       const sseRegistry = new ToolRegistry(ghlClient);
-      sseRegistry.registerAll(sseServer);
+      const sseRegNames = new Set(sseRegistry.getAllToolNames());
+      const sseFilteredAppTools = appTools.filter((t: any) => !sseRegNames.has(t.name));
+      const sseAllToolDefs = sseRegistry.getAllToolDefinitions(sseFilteredAppTools);
 
-      // Register app tools (skip duplicates)
-      const sseRegisteredNames = new Set(sseRegistry.getAllToolNames());
-      for (const tool of appTools) {
-        if (sseRegisteredNames.has(tool.name)) continue;
-        const meta = (tool as any)._meta;
-        sseServer.registerTool(
-          tool.name,
-          {
-            title: tool.name.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase()),
-            description: tool.description || '',
-            annotations: {
-              readOnlyHint: tool.name.startsWith('view_'),
-              destructiveHint: false,
-              idempotentHint: tool.name.startsWith('view_'),
-              openWorldHint: true,
-            },
-            _meta: meta,
-          },
-          async (args: any) => {
-            try {
-              const result = await appsManager.executeTool(tool.name, args || {});
-              return {
-                content: result.content || [{ type: 'text' as const, text: JSON.stringify(result) }],
-                structuredContent: result.structuredContent,
-              };
-            } catch (err: any) {
-              return {
-                content: [{ type: 'text' as const, text: `Error: ${err.message}` }],
-                isError: true,
-              };
-            }
+      sseServer.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: sseAllToolDefs }));
+      sseServer.setRequestHandler(CallToolRequestSchema, async (request) => {
+        const { name, arguments: args } = request.params;
+        try {
+          const result = await sseRegistry.callTool(name, args || {});
+          if (result !== undefined) {
+            const text = typeof result === 'string' ? result : JSON.stringify(result, null, 2);
+            return { content: [{ type: 'text' as const, text }] };
           }
-        );
-      }
+          if (appsManager.isAppTool(name)) {
+            const appResult = await appsManager.executeTool(name, args || {});
+            return {
+              content: appResult.content || [{ type: 'text' as const, text: JSON.stringify(appResult) }],
+              structuredContent: appResult.structuredContent,
+            };
+          }
+          throw new McpError(ErrorCode.MethodNotFound, `Tool ${name} not found`);
+        } catch (err: any) {
+          if (err instanceof McpError) throw err;
+          return {
+            content: [{ type: 'text' as const, text: `Error executing ${name}: ${err.message}` }],
+            isError: true,
+          };
+        }
+      });
 
       const transport = new SSEServerTransport('/sse', res);
       await sseServer.connect(transport);
