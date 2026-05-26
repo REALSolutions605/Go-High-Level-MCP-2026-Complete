@@ -1120,7 +1120,7 @@ export function registerPAERoutes(app: Application, log: LogFn): void {
     let apiResult: any;
     try {
       const response = await callClaudeAPI(ANTHROPIC_API_KEY, {
-        model: 'claude-sonnet-4-20250514',
+        model: 'claude-sonnet-4-6',
         max_tokens: 8192,
         system: SYSTEM_PROMPT,
         messages: [{ role: 'user', content: userMessage }],
