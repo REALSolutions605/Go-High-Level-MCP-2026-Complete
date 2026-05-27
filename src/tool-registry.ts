@@ -170,7 +170,9 @@ function jsonSchemaToZod(schema: any): z.ZodTypeAny {
             const fieldZod = jsonSchemaToZod(v);
             shape[k] = reqSet.has(k) ? fieldZod : fieldZod.optional();
           }
-          zType = z.object(shape);
+          // passthrough() preserves unknown properties so complex nested
+          // payloads (e.g. workflow actions arrays) reach the handler intact
+          zType = z.object(shape).passthrough();
         } else {
           zType = z.record(z.string(), z.unknown());
         }
