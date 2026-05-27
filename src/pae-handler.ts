@@ -1101,7 +1101,7 @@ export function registerPAERoutes(app: Application, log: LogFn): void {
 
     // 3. Build user message
     const userMessage =
-      'Analyze the following real estate deal opportunity. Return your analysis as a single JSON object following the schema defined in your system prompt. Do not include any text outside the JSON object.\n\nDEAL DATA:\n' +
+      'Analyze the following real estate deal opportunity. Return your analysis as a single JSON object following the schema defined in your system prompt. Do not include any text outside the JSON object.\n\nIMPORTANT: Keep ALL string/notes/reasoning fields concise — maximum 2 sentences each. Do not write verbose calculations or multi-paragraph explanations inside JSON string values. Use numeric fields for numbers.\n\nDEAL DATA:\n' +
       JSON.stringify(dealData, null, 2);
 
     // 4. Call Claude
@@ -1121,7 +1121,7 @@ export function registerPAERoutes(app: Application, log: LogFn): void {
     try {
       const response = await callClaudeAPI(ANTHROPIC_API_KEY, {
         model: 'claude-haiku-4-5-20251001',
-        max_tokens: 3500,
+        max_tokens: 5500,
         system: SYSTEM_PROMPT,
         messages: [{ role: 'user', content: userMessage }],
       });
