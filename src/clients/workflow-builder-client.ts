@@ -514,7 +514,12 @@ export class WorkflowBuilderClient {
 
       let nextArr: string[] | undefined;
       if (hasExplicitNext) {
-        nextArr = Array.isArray(original.next) ? original.next : undefined;
+        // Preserve arrays; normalise string "next" to a single-element array
+        if (Array.isArray(original.next)) {
+          nextArr = original.next;
+        } else if (typeof original.next === 'string' && original.next) {
+          nextArr = [original.next];
+        }
       } else if (i < arr.length - 1) {
         nextArr = [arr[i + 1].id!];
       }
