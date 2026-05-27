@@ -119,6 +119,8 @@ async function main() {
       {
         title: tool.name.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase()),
         description: tool.description || '',
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        inputSchema: tool.inputSchema as any,
         annotations: {
           readOnlyHint: tool.name.startsWith('view_'),
           destructiveHint: false,

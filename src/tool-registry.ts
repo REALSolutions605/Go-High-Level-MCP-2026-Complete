@@ -127,14 +127,65 @@ function inferAnnotations(toolName: string, meta?: any): ToolAnnotations {
 
 /**
  * Convert JSON Schema inputSchema to a Zod passthrough object
- * We use z.object({}).passthrough() to accept any args since the
- * original schemas are JSON Schema, not Zod. The MCP SDK will
- * still send the original JSON Schema to clients.
+ * Converts a JSON Schema object to a Zod schema so the MCP SDK can
+ * properly advertise tool parameters and convert to wire-format JSON Schema.
  */
-function makeZodSchema(_jsonSchema: any): z.ZodTypeAny {
-  // Use a catch-all that accepts any object
-  // The actual validation happens in the tool handler
-  return z.object({}).passthrough();
+function jsonSchemaToZod(schema: any): z.ZodTypeAny {
+  if (!schema || typeof schema !== 'object') return z.unknown();
+
+  const { type, description, enum: enumVals, properties, required, items, anyOf, oneOf } = schema;
+  const reqSet = new Set<string>(Array.isArray(required) ? required : []);
+
+  let zType: z.ZodTypeAny;
+
+  if (Array.isArray(enumVals) && enumVals.length > 0) {
+    zType = z.enum(enumVals as [string, ...string[]]);
+  } else if (anyOf && Array.isArray(anyOf) && anyOf.length >= 2) {
+    const variants = (anyOf as any[]).map(jsonSchemaToZod) as [z.ZodTypeAny, z.ZodTypeAny, ...z.ZodTypeAny[]];
+    zType = z.union(variants);
+  } else if (oneOf && Array.isArray(oneOf) && oneOf.length >= 2) {
+    const variants = (oneOf as any[]).map(jsonSchemaToZod) as [z.ZodTypeAny, z.ZodTypeAny, ...z.ZodTypeAny[]];
+    zType = z.union(variants);
+  } else {
+    switch (type) {
+      case 'string':
+        zType = z.string();
+        break;
+      case 'number':
+      case 'integer':
+        zType = z.number();
+        break;
+      case 'boolean':
+        zType = z.boolean();
+        break;
+      case 'array': {
+        const itemZod = items ? jsonSchemaToZod(items) : z.unknown();
+        zType = z.array(itemZod);
+        break;
+      }
+      case 'object': {
+        if (properties && typeof properties === 'object') {
+          const shape: Record<string, z.ZodTypeAny> = {};
+          for (const [k, v] of Object.entries(properties as Record<string, any>)) {
+            const fieldZod = jsonSchemaToZod(v);
+            shape[k] = reqSet.has(k) ? fieldZod : fieldZod.optional();
+          }
+          zType = z.object(shape);
+        } else {
+          zType = z.record(z.string(), z.unknown());
+        }
+        break;
+      }
+      default:
+        zType = z.unknown();
+    }
+  }
+
+  if (description && typeof description === 'string') {
+    try { zType = (zType as any).describe(description); } catch { /* noop */ }
+  }
+
+  return zType;
 }
 
 // ─── Tool Registry ──────────────────────────────────────────
@@ -296,6 +347,8 @@ export class ToolRegistry {
           {
             title: annotations.title,
             description: tool.description || '',
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            inputSchema: tool.inputSchema ? (jsonSchemaToZod(tool.inputSchema) as any) : undefined,
             annotations,
             _meta: meta,
           },
