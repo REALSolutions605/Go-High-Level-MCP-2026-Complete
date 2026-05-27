@@ -1219,6 +1219,7 @@ export function registerPAERoutes(app: Application, log: LogFn): void {
       asset_class:      inputSummary.asset_class      ?? dealData.asset_class,
       deal_source:      inputSummary.deal_source      ?? dealData.deal_source,
       submitter:        inputSummary.submitter        ?? dealData.submitter_name,
+      submitter_email:  dealData.submitter_email,
 
       // Scoring
       composite_score:    sovereign.composite_score    ?? 0,
