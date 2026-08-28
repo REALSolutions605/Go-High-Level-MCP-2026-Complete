@@ -68,7 +68,9 @@ export class WorkflowBuilderTools {
       {
         name: 'ghl_create_workflow',
         description:
-          'Create a new GHL workflow with optional trigger and actions. ' +
+          'Create a new GHL workflow with actions. ' +
+          'NOTE: a NEW trigger cannot be created through this API — GHL requires the trigger ' +
+          'document to exist first, so add it in the GHL UI. ' +
           'Actions are chained automatically via next/parentKey unless you provide explicit linkage (for branching). ' +
           'Returns the created workflow with ID, status, and action details. ' +
           'Trigger types: contact_tag, contact_created, form_submission, customer_reply, appointment, inbound_webhook, payment_received, etc. ' +
@@ -298,9 +300,10 @@ export class WorkflowBuilderTools {
       {
         name: 'ghl_clone_workflow',
         description:
-          'Duplicate an existing workflow with a new name. Clones all actions and triggers ' +
-          'with remapped IDs. The clone starts as a draft. ' +
-          'Returns the new workflow with its ID and full action data.',
+          'Duplicate an existing workflow with a new name. Clones all actions with remapped IDs. ' +
+          'Triggers are NOT copied — a clone needs its own trigger document and this API cannot ' +
+          'create one; the response names any trigger you need to re-add in the GHL UI. ' +
+          'The clone starts as a draft. Returns the new workflow with its ID and full action data.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -362,13 +365,18 @@ export class WorkflowBuilderTools {
     const name = params.name as string;
     if (!name) return error('name is required');
 
-    // Step 1: Create empty workflow
-    const { id } = await this.client!.createWorkflow(name);
-
-    // Step 2: Add actions if provided
     const rawActions = params.actions as WorkflowAction[] | undefined;
     const trigger = params.trigger as WorkflowTrigger | undefined;
     const publish = params.publish as boolean | undefined;
+
+    // Validate BEFORE creating anything — a trigger that cannot be created
+    // fails the workflow save, which used to leave an empty orphan behind.
+    if (trigger && !trigger.id) {
+      return error(WorkflowBuilderClient.triggerCreateHelp());
+    }
+
+    // Step 1: Create empty workflow
+    const { id } = await this.client!.createWorkflow(name);
 
     if (rawActions?.length || trigger) {
       await this.client!.updateWorkflow(id, {
@@ -511,6 +519,7 @@ export class WorkflowBuilderTools {
 
     const newName = params.newName as string | undefined;
     const workflow = await this.client!.cloneWorkflow(workflowId, newName);
+    const skipped = (workflow.skippedTriggers as { type: string; name?: string }[]) || [];
 
     return success({
       message: `Workflow cloned as "${workflow.name}"`,
@@ -524,6 +533,12 @@ export class WorkflowBuilderTools {
         triggerCount: workflow.triggers?.length || 0,
         url: `https://app.gohighlevel.com/v2/location/${this.client!.getLocationId()}/automation/workflow/${workflow._id}`,
       },
+      ...(skipped.length > 0 && {
+        warning:
+          `The source workflow's ${skipped.length} trigger(s) were NOT copied — ` +
+          'a clone needs its own trigger document and this API cannot create one. ' +
+          `Add them in the GHL UI: ${skipped.map(t => `${t.name || t.type} (${t.type})`).join(', ')}.`,
+      }),
     });
   }
 }
