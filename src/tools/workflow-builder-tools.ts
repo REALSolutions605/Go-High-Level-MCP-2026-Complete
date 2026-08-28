@@ -168,6 +168,12 @@ export class WorkflowBuilderTools {
                 'Return the raw GHL response verbatim, with no projection or field normalisation. ' +
                 'Use when a field appears to be missing from the normal output.',
             },
+            subpath: {
+              type: 'string',
+              description:
+                'With raw=true, read a sub-resource of the workflow instead (e.g. "triggers") ' +
+                'or append a query string (e.g. "?includeTriggers=true").',
+            },
           },
           required: ['workflowId'],
           additionalProperties: false,
@@ -422,7 +428,9 @@ export class WorkflowBuilderTools {
     if (!workflowId) return error('workflowId is required');
 
     if (params.raw === true) {
-      return success(await this.client!.getWorkflowRaw(workflowId));
+      return success(
+        await this.client!.getWorkflowRaw(workflowId, params.subpath as string | undefined)
+      );
     }
 
     const workflow = await this.client!.getWorkflow(workflowId);

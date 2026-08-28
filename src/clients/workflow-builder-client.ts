@@ -347,11 +347,19 @@ export class WorkflowBuilderClient {
    * Get a workflow exactly as GHL returns it, with no normalisation or
    * projection. Escape hatch for inspecting fields this client does not model.
    */
-  async getWorkflowRaw(workflowId: string): Promise<Record<string, unknown>> {
-    const { data } = await this.request<Record<string, unknown>>(
-      'GET',
-      `/${this.config.locationId}/${workflowId}`
-    );
+  async getWorkflowRaw(
+    workflowId: string,
+    subpath?: string
+  ): Promise<Record<string, unknown>> {
+    let path = `/${this.config.locationId}/${workflowId}`;
+    if (subpath) {
+      const clean = subpath.replace(/^\/+/, '');
+      if (!/^[A-Za-z0-9/_?=&-]+$/.test(clean) || clean.includes('..')) {
+        throw new Error(`Invalid subpath: ${subpath}`);
+      }
+      path += clean.startsWith('?') ? clean : `/${clean}`;
+    }
+    const { data } = await this.request<Record<string, unknown>>('GET', path);
     return data;
   }
 
