@@ -329,37 +329,37 @@ export class WorkflowBuilderClient {
   /**
    * Get a workflow with full workflowData (actions, triggers, etc.)
    *
-   * The response is returned verbatim except that `triggers` is normalised —
-   * GHL does not consistently put the trigger list under a top-level
-   * `triggers` key, so reading it straight off the response silently yielded
-   * `[]` for workflows that demonstrably have a trigger. See
-   * {@link extractTriggers}.
+   * A plain GET does NOT carry the trigger list — triggers live in a separate
+   * storage object (see the workflow's `triggersFilePath`) and the response
+   * only names the path, which is why this used to report `triggers: []` for
+   * every workflow. `?includeTriggers=true` makes GHL hydrate them, at the
+   * cost of wrapping the whole response in an envelope. See
+   * {@link unwrapWorkflow}.
    */
   async getWorkflow(workflowId: string): Promise<WorkflowFull> {
-    const { data } = await this.request<WorkflowFull>(
+    const { data } = await this.request<unknown>(
       'GET',
-      `/${this.config.locationId}/${workflowId}`
+      `/${this.config.locationId}/${workflowId}?includeTriggers=true`
     );
-    return { ...data, triggers: WorkflowBuilderClient.extractTriggers(data) };
+    return WorkflowBuilderClient.unwrapWorkflow(data);
   }
 
   /**
    * Get a workflow exactly as GHL returns it, with no normalisation or
    * projection. Escape hatch for inspecting fields this client does not model.
+   *
+   * `includeTriggers` selects the enveloped form
+   * (`{ workflowData, triggers, permissionMeta, dependentAssets }`).
    */
   async getWorkflowRaw(
     workflowId: string,
-    subpath?: string
+    includeTriggers = false
   ): Promise<Record<string, unknown>> {
-    let path = `/${this.config.locationId}/${workflowId}`;
-    if (subpath) {
-      const clean = subpath.replace(/^\/+/, '');
-      if (!/^[A-Za-z0-9/_?=&-]+$/.test(clean) || clean.includes('..')) {
-        throw new Error(`Invalid subpath: ${subpath}`);
-      }
-      path += clean.startsWith('?') ? clean : `/${clean}`;
-    }
-    const { data } = await this.request<Record<string, unknown>>('GET', path);
+    const query = includeTriggers ? '?includeTriggers=true' : '';
+    const { data } = await this.request<Record<string, unknown>>(
+      'GET',
+      `/${this.config.locationId}/${workflowId}${query}`
+    );
     return data;
   }
 
@@ -410,23 +410,7 @@ export class WorkflowBuilderClient {
 
     // Build triggers
     const newTriggers = update.triggers
-      ? update.triggers.map(t => {
-          const { id, type, name, data, workflowId: _ignored, ...rest } = t;
-          return {
-            // Preserve fields GHL round-tripped to us (filters, key, ...) so a
-            // clone or an edit does not silently strip trigger configuration.
-            ...rest,
-            id: id || randomUUID(),
-            type,
-            name: name || type.replace(/_/g, ' ').replace(/\b\w/g, (c: string) => c.toUpperCase()),
-            workflowId,
-            data: {
-              type,
-              targetActionId: actions[0]?.id,
-              ...(data || {}),
-            },
-          };
-        })
+      ? update.triggers.map(t => this.buildTriggerDocument(t, workflowId))
       : undefined;
 
     const createdSteps = update.actions
@@ -528,18 +512,23 @@ export class WorkflowBuilderClient {
       return cloned;
     });
 
-    // Clone triggers with remapped targetActionId. Everything the source
-    // trigger carried is kept — only the identity and node references change.
-    const clonedTriggers: WorkflowTrigger[] = (source.triggers || []).map(t => ({
-      ...t,
-      id: randomUUID(),
-      data: {
-        ...t.data,
-        targetActionId: t.data?.targetActionId
-          ? idMap.get(t.data.targetActionId as string) || t.data.targetActionId
-          : undefined,
-      },
-    }));
+    // Clone triggers. Everything the source trigger configured is kept; only
+    // identity is dropped, so GHL mints a fresh trigger document for the copy
+    // rather than the clone pointing at the original's trigger.
+    // `workflow_id`/`location_id`/`actions` are re-pointed in
+    // buildTriggerDocument, which knows the destination workflow.
+    const clonedTriggers: WorkflowTrigger[] = (source.triggers || []).map(t => {
+      const { id: _id, ...rest } = t;
+      const data = t.data
+        ? {
+            ...t.data,
+            targetActionId: t.data.targetActionId
+              ? idMap.get(t.data.targetActionId as string) || t.data.targetActionId
+              : undefined,
+          }
+        : undefined;
+      return { ...rest, type: t.type, ...(data ? { data } : {}) };
+    });
 
     // Update with cloned data
     return this.updateWorkflow(newId, {
@@ -551,55 +540,109 @@ export class WorkflowBuilderClient {
   // ─── Helpers ────────────────────────────────────────────
 
   /**
-   * Locations the GHL workflow GET has been observed (or is plausible) to
-   * carry the trigger list, in priority order. Checked first-non-empty-wins.
-   */
-  private static readonly TRIGGER_PATHS: readonly string[][] = [
-    ['triggers'],
-    ['workflowData', 'triggers'],
-    ['workflowTriggers'],
-    ['eventStartTriggers'],
-    ['workflowData', 'eventStartTriggers'],
-    ['oldTriggers'],
-  ];
-
-  /**
-   * Pull the trigger list out of a workflow GET response.
+   * Build the trigger document GHL actually stores.
    *
-   * `ghl_get_workflow_full` used to read `response.triggers` and nothing else,
-   * so it reported `triggers: []` for every workflow — including ones with a
-   * live trigger. That also made `cloneWorkflow` drop the source trigger,
-   * since it clones from the same (empty) field.
+   * Previously this sent an invented shape — `{ id, type, name, workflowId,
+   * data: { type, targetActionId } }` — with a locally minted UUID. GHL has no
+   * such document, so the save failed with
+   * `5 NOT_FOUND: No document to update: .../documents/triggers/<uuid>`:
+   * supplying an id told the backend to UPDATE a trigger that had never been
+   * created, and the whole workflow write was rejected with it.
    *
-   * Each candidate location is tried in turn and the first non-empty array
-   * wins. Entries are normalised to {@link WorkflowTrigger} — `_id`/`eventType`
-   * /`key` are folded onto `id`/`type` — while every other field is preserved
-   * verbatim so nothing is lost on a read → write round-trip.
+   * A real trigger document looks like:
+   *
+   *   { id, workflow_id, location_id, type, name, active, deleted,
+   *     conditions: [], actions: [{ type: 'add_to_workflow', workflow_id }],
+   *     masterType: 'highlevel', belongs_to: 'workflow' }
+   *
+   * `id` is therefore omitted unless the caller is editing a trigger that
+   * already exists — GHL mints it for new ones.
    */
-  private static extractTriggers(raw: unknown): WorkflowTrigger[] {
-    if (!raw || typeof raw !== 'object') return [];
+  private buildTriggerDocument(
+    trigger: WorkflowTrigger,
+    workflowId: string
+  ): Record<string, unknown> {
+    const {
+      id,
+      type,
+      name,
+      data,
+      workflowId: _camelWorkflowId,
+      date_added: _dateAdded,
+      date_updated: _dateUpdated,
+      ...rest
+    } = trigger;
 
-    for (const path of WorkflowBuilderClient.TRIGGER_PATHS) {
-      let cursor: unknown = raw;
-      for (const key of path) {
-        cursor =
-          cursor && typeof cursor === 'object'
-            ? (cursor as Record<string, unknown>)[key]
-            : undefined;
-      }
-      if (Array.isArray(cursor) && cursor.length > 0) {
-        return cursor
-          .filter((t): t is Record<string, unknown> => !!t && typeof t === 'object')
-          .map(t => WorkflowBuilderClient.normaliseTrigger(t));
-      }
-    }
-
-    return [];
+    return {
+      // Anything GHL round-tripped to us that this client does not model.
+      ...rest,
+      // Only send an id for a trigger that already exists; a minted one makes
+      // the backend attempt an update against a nonexistent document.
+      ...(id ? { id } : {}),
+      type,
+      name: name || type.replace(/_/g, ' ').replace(/\b\w/g, (c: string) => c.toUpperCase()),
+      workflow_id: workflowId,
+      location_id: this.config.locationId,
+      belongs_to: rest.belongs_to ?? 'workflow',
+      masterType: rest.masterType ?? 'highlevel',
+      active: rest.active ?? true,
+      deleted: rest.deleted ?? false,
+      conditions: rest.conditions ?? [],
+      // A trigger's own actions point back at the workflow it starts. On a
+      // clone those still name the SOURCE workflow, so re-point them.
+      actions: Array.isArray(rest.actions) && rest.actions.length > 0
+        ? rest.actions.map(a =>
+            a && typeof a === 'object' && 'workflow_id' in a
+              ? { ...(a as Record<string, unknown>), workflow_id: workflowId }
+              : a
+          )
+        : [{ type: 'add_to_workflow', workflow_id: workflowId }],
+      // Trigger documents have no `data` field; pass one through only if the
+      // caller explicitly supplied it.
+      ...(data ? { data } : {}),
+    };
   }
 
   /**
-   * Fold GHL's trigger field aliases onto this client's shape without
-   * discarding anything it does not model.
+   * Flatten a workflow GET response into a {@link WorkflowFull}.
+   *
+   * With `?includeTriggers=true` GHL answers with an envelope:
+   *
+   *   { workflowData: <the workflow>, triggers: [...],
+   *     permissionMeta: {...}, dependentAssets: {...} }
+   *
+   * Note the collision: the envelope key `workflowData` holds the workflow
+   * document, which itself has a `workflowData` holding `templates`. Without
+   * `includeTriggers` the workflow document is returned unwrapped, so both
+   * forms are handled.
+   */
+  private static unwrapWorkflow(raw: unknown): WorkflowFull {
+    const envelope = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
+    const inner = envelope.workflowData as Record<string, unknown> | undefined;
+
+    // The envelope's `workflowData` is the workflow itself (it carries _id);
+    // the unwrapped form's `workflowData` only carries `templates`.
+    const isEnvelope = !!inner && typeof inner === 'object' && '_id' in inner;
+
+    const workflow = (isEnvelope ? inner : envelope) as WorkflowFull;
+    const triggers = isEnvelope ? envelope.triggers : workflow.triggers;
+
+    return {
+      ...workflow,
+      triggers: Array.isArray(triggers)
+        ? triggers
+            .filter((t): t is Record<string, unknown> => !!t && typeof t === 'object')
+            .map(t => WorkflowBuilderClient.normaliseTrigger(t))
+        : [],
+    };
+  }
+
+  /**
+   * Give a GHL trigger document the `id`/`type`/`name` this client's interface
+   * promises, without discarding the snake_case fields GHL actually stores
+   * (`workflow_id`, `location_id`, `conditions`, `actions`, `masterType`,
+   * `belongs_to`, `active`, ...). Keeping them is what lets a trigger survive
+   * a read → write round-trip such as a clone.
    */
   private static normaliseTrigger(t: Record<string, unknown>): WorkflowTrigger {
     const pick = (...keys: string[]): string | undefined => {

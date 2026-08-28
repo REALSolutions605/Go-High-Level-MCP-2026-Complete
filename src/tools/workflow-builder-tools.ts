@@ -82,11 +82,12 @@ export class WorkflowBuilderTools {
             },
             trigger: {
               type: 'object',
-              description: 'Optional trigger. Properties: type (string, required), name (string), data (object with trigger-specific config like tagName, tagEvent)',
+              description: 'Optional trigger. GHL mints the trigger ID — do not supply one for a new trigger.',
               properties: {
                 type: { type: 'string', description: 'Trigger type: contact_tag, form_submission, contact_created, customer_reply, appointment, inbound_webhook, payment_received, etc.' },
                 name: { type: 'string', description: 'Display name for the trigger' },
-                data: { type: 'object', description: 'Trigger-specific data, e.g. {tagName: "hot-lead", tagEvent: "added"} for contact_tag' },
+                conditions: { type: 'array', description: 'Trigger filters, as GHL stores them. Empty for an unconditional trigger such as inbound_webhook.' },
+                data: { type: 'object', description: 'Extra trigger-specific config, passed through verbatim.' },
               },
               required: ['type'],
             },
@@ -165,14 +166,10 @@ export class WorkflowBuilderTools {
             raw: {
               type: 'boolean',
               description:
-                'Return the raw GHL response verbatim, with no projection or field normalisation. ' +
-                'Use when a field appears to be missing from the normal output.',
-            },
-            subpath: {
-              type: 'string',
-              description:
-                'With raw=true, read a sub-resource of the workflow instead (e.g. "triggers") ' +
-                'or append a query string (e.g. "?includeTriggers=true").',
+                'Return the raw GHL response verbatim (the enveloped ' +
+                '{workflowData, triggers, permissionMeta, dependentAssets} form), with no ' +
+                'projection or field normalisation. Use when a field appears to be missing ' +
+                'from the normal output.',
             },
           },
           required: ['workflowId'],
@@ -228,12 +225,17 @@ export class WorkflowBuilderTools {
             },
             triggers: {
               type: 'array',
-              description: 'New triggers — replaces existing triggers',
+              description:
+                'New triggers — replaces existing triggers. Omit entirely to leave the ' +
+                "workflow's existing triggers untouched. GHL mints trigger IDs; supply " +
+                'an id only to edit a trigger that already exists.',
               items: {
                 type: 'object',
                 properties: {
                   type: { type: 'string' },
                   name: { type: 'string' },
+                  id: { type: 'string', description: 'Only for editing an existing trigger' },
+                  conditions: { type: 'array', description: 'Trigger filters as GHL stores them' },
                   data: { type: 'object' },
                 },
                 required: ['type'],
@@ -397,6 +399,8 @@ export class WorkflowBuilderTools {
           name: t.name,
           id: t.id,
         })),
+        triggerCount: workflow.triggers?.length || 0,
+        triggers: (workflow.triggers || []).map(t => ({ id: t.id, type: t.type, name: t.name })),
         url: `https://app.gohighlevel.com/v2/location/${this.client!.getLocationId()}/automation/workflow/${workflow._id}`,
       },
     });
@@ -428,9 +432,7 @@ export class WorkflowBuilderTools {
     if (!workflowId) return error('workflowId is required');
 
     if (params.raw === true) {
-      return success(
-        await this.client!.getWorkflowRaw(workflowId, params.subpath as string | undefined)
-      );
+      return success(await this.client!.getWorkflowRaw(workflowId, true));
     }
 
     const workflow = await this.client!.getWorkflow(workflowId);
@@ -471,6 +473,8 @@ export class WorkflowBuilderTools {
         name: t.name,
         id: t.id,
       })),
+      triggerCount: workflow.triggers?.length || 0,
+      triggers: (workflow.triggers || []).map(t => ({ id: t.id, type: t.type, name: t.name })),
     });
   }
 
@@ -517,6 +521,7 @@ export class WorkflowBuilderTools {
         status: workflow.status,
         version: workflow.version,
         actionCount: workflow.workflowData?.templates?.length || 0,
+        triggerCount: workflow.triggers?.length || 0,
         url: `https://app.gohighlevel.com/v2/location/${this.client!.getLocationId()}/automation/workflow/${workflow._id}`,
       },
     });
