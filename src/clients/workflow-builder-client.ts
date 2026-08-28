@@ -43,6 +43,12 @@ export interface WorkflowTrigger {
   name?: string;
   workflowId?: string;
   data?: Record<string, unknown>;
+  /**
+   * GHL returns trigger documents with fields we do not model (filters, key,
+   * eventType, locationId, ...). Keep them so a read → write round-trip
+   * (clone, in particular) does not silently drop trigger configuration.
+   */
+  [key: string]: unknown;
 }
 
 export interface WorkflowListItem {
@@ -322,9 +328,27 @@ export class WorkflowBuilderClient {
 
   /**
    * Get a workflow with full workflowData (actions, triggers, etc.)
+   *
+   * The response is returned verbatim except that `triggers` is normalised —
+   * GHL does not consistently put the trigger list under a top-level
+   * `triggers` key, so reading it straight off the response silently yielded
+   * `[]` for workflows that demonstrably have a trigger. See
+   * {@link extractTriggers}.
    */
   async getWorkflow(workflowId: string): Promise<WorkflowFull> {
     const { data } = await this.request<WorkflowFull>(
+      'GET',
+      `/${this.config.locationId}/${workflowId}`
+    );
+    return { ...data, triggers: WorkflowBuilderClient.extractTriggers(data) };
+  }
+
+  /**
+   * Get a workflow exactly as GHL returns it, with no normalisation or
+   * projection. Escape hatch for inspecting fields this client does not model.
+   */
+  async getWorkflowRaw(workflowId: string): Promise<Record<string, unknown>> {
+    const { data } = await this.request<Record<string, unknown>>(
       'GET',
       `/${this.config.locationId}/${workflowId}`
     );
@@ -378,17 +402,23 @@ export class WorkflowBuilderClient {
 
     // Build triggers
     const newTriggers = update.triggers
-      ? update.triggers.map(t => ({
-          id: t.id || randomUUID(),
-          type: t.type,
-          name: t.name || t.type.replace(/_/g, ' ').replace(/\b\w/g, (c: string) => c.toUpperCase()),
-          workflowId,
-          data: {
-            type: t.type,
-            targetActionId: actions[0]?.id,
-            ...(t.data || {}),
-          },
-        }))
+      ? update.triggers.map(t => {
+          const { id, type, name, data, workflowId: _ignored, ...rest } = t;
+          return {
+            // Preserve fields GHL round-tripped to us (filters, key, ...) so a
+            // clone or an edit does not silently strip trigger configuration.
+            ...rest,
+            id: id || randomUUID(),
+            type,
+            name: name || type.replace(/_/g, ' ').replace(/\b\w/g, (c: string) => c.toUpperCase()),
+            workflowId,
+            data: {
+              type,
+              targetActionId: actions[0]?.id,
+              ...(data || {}),
+            },
+          };
+        })
       : undefined;
 
     const createdSteps = update.actions
@@ -490,11 +520,11 @@ export class WorkflowBuilderClient {
       return cloned;
     });
 
-    // Clone triggers with remapped targetActionId
+    // Clone triggers with remapped targetActionId. Everything the source
+    // trigger carried is kept — only the identity and node references change.
     const clonedTriggers: WorkflowTrigger[] = (source.triggers || []).map(t => ({
+      ...t,
       id: randomUUID(),
-      type: t.type,
-      name: t.name,
       data: {
         ...t.data,
         targetActionId: t.data?.targetActionId
@@ -511,6 +541,74 @@ export class WorkflowBuilderClient {
   }
 
   // ─── Helpers ────────────────────────────────────────────
+
+  /**
+   * Locations the GHL workflow GET has been observed (or is plausible) to
+   * carry the trigger list, in priority order. Checked first-non-empty-wins.
+   */
+  private static readonly TRIGGER_PATHS: readonly string[][] = [
+    ['triggers'],
+    ['workflowData', 'triggers'],
+    ['workflowTriggers'],
+    ['eventStartTriggers'],
+    ['workflowData', 'eventStartTriggers'],
+    ['oldTriggers'],
+  ];
+
+  /**
+   * Pull the trigger list out of a workflow GET response.
+   *
+   * `ghl_get_workflow_full` used to read `response.triggers` and nothing else,
+   * so it reported `triggers: []` for every workflow — including ones with a
+   * live trigger. That also made `cloneWorkflow` drop the source trigger,
+   * since it clones from the same (empty) field.
+   *
+   * Each candidate location is tried in turn and the first non-empty array
+   * wins. Entries are normalised to {@link WorkflowTrigger} — `_id`/`eventType`
+   * /`key` are folded onto `id`/`type` — while every other field is preserved
+   * verbatim so nothing is lost on a read → write round-trip.
+   */
+  private static extractTriggers(raw: unknown): WorkflowTrigger[] {
+    if (!raw || typeof raw !== 'object') return [];
+
+    for (const path of WorkflowBuilderClient.TRIGGER_PATHS) {
+      let cursor: unknown = raw;
+      for (const key of path) {
+        cursor =
+          cursor && typeof cursor === 'object'
+            ? (cursor as Record<string, unknown>)[key]
+            : undefined;
+      }
+      if (Array.isArray(cursor) && cursor.length > 0) {
+        return cursor
+          .filter((t): t is Record<string, unknown> => !!t && typeof t === 'object')
+          .map(t => WorkflowBuilderClient.normaliseTrigger(t));
+      }
+    }
+
+    return [];
+  }
+
+  /**
+   * Fold GHL's trigger field aliases onto this client's shape without
+   * discarding anything it does not model.
+   */
+  private static normaliseTrigger(t: Record<string, unknown>): WorkflowTrigger {
+    const pick = (...keys: string[]): string | undefined => {
+      for (const k of keys) {
+        const v = t[k];
+        if (typeof v === 'string' && v) return v;
+      }
+      return undefined;
+    };
+
+    return {
+      ...t,
+      id: pick('id', '_id'),
+      type: pick('type', 'eventType', 'key') || '',
+      name: pick('name', 'triggerName'),
+    };
+  }
 
   /**
    * Remap node-ID references that live inside an action's `attributes`.
