@@ -100,7 +100,16 @@ export class WorkflowBuilderTools {
                   name: { type: 'string', description: 'Display name' },
                   attributes: { type: 'object', description: 'Action config (body, tags, delay, conditions, etc.)' },
                   id: { type: 'string', description: 'Optional UUID — auto-generated if omitted' },
-                  next: { type: 'array', items: { type: 'string' }, description: 'Next action ID(s) — auto-chained if omitted' },
+                  next: {
+                    anyOf: [
+                      { type: 'string' },
+                      { type: 'array', items: { type: 'string' } },
+                    ],
+                    description:
+                      'Next action ID(s) — auto-chained if omitted. Use a SCALAR string for a normal (non-branching) step; ' +
+                      'use an ARRAY only on a branch/router node (nodeType "condition-node" or cat "multi-path"). ' +
+                      'Omit entirely on a terminal step — an empty array is rejected by GHL.',
+                  },
                   parentKey: { type: 'string', description: 'Previous action ID — auto-set if omitted' },
                   cat: { type: 'string', description: 'Category (conditions, multi-path, transition)' },
                   nodeType: { type: 'string', description: 'Node type (condition-node, branch-yes, branch-no)' },
@@ -188,7 +197,15 @@ export class WorkflowBuilderTools {
                   name: { type: 'string' },
                   attributes: { type: 'object' },
                   id: { type: 'string' },
-                  next: { type: 'array', items: { type: 'string' } },
+                  next: {
+                    anyOf: [
+                      { type: 'string' },
+                      { type: 'array', items: { type: 'string' } },
+                    ],
+                    description:
+                      'Next action ID(s) — auto-chained if omitted. SCALAR string for a normal step; ' +
+                      'ARRAY only on a branch/router node; omit entirely on a terminal step.',
+                  },
                   parentKey: { type: 'string' },
                   cat: { type: 'string' },
                   nodeType: { type: 'string' },
