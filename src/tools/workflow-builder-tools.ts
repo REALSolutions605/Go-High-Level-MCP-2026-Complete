@@ -153,13 +153,20 @@ export class WorkflowBuilderTools {
         name: 'ghl_get_workflow_full',
         description:
           'Get a single workflow with full detail: all action nodes (workflowData.templates), ' +
-          'triggers, version, status, and metadata. Use this to inspect workflow structure before updating.',
+          'triggers, version, status, and metadata. Use this to inspect workflow structure before updating. ' +
+          'Set raw=true to get the unprojected GHL response instead, including fields this server does not model.',
         inputSchema: {
           type: 'object',
           properties: {
             workflowId: {
               type: 'string',
               description: 'The workflow ID to retrieve',
+            },
+            raw: {
+              type: 'boolean',
+              description:
+                'Return the raw GHL response verbatim, with no projection or field normalisation. ' +
+                'Use when a field appears to be missing from the normal output.',
             },
           },
           required: ['workflowId'],
@@ -413,6 +420,10 @@ export class WorkflowBuilderTools {
   private async getWorkflowFull(params: Record<string, unknown>): Promise<ToolResult> {
     const workflowId = params.workflowId as string;
     if (!workflowId) return error('workflowId is required');
+
+    if (params.raw === true) {
+      return success(await this.client!.getWorkflowRaw(workflowId));
+    }
 
     const workflow = await this.client!.getWorkflow(workflowId);
 
