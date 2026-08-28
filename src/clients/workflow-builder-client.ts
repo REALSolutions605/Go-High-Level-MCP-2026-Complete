@@ -400,6 +400,9 @@ export class WorkflowBuilderClient {
       deletedSteps?: string[];
     }
   ): Promise<WorkflowFull> {
+    const unsupported = WorkflowBuilderClient.triggerCreateUnsupported(update.triggers);
+    if (unsupported) throw new Error(unsupported);
+
     // Get current state for version
     const current = await this.getWorkflow(workflowId);
 
@@ -512,51 +515,77 @@ export class WorkflowBuilderClient {
       return cloned;
     });
 
-    // Clone triggers. Everything the source trigger configured is kept; only
-    // identity is dropped, so GHL mints a fresh trigger document for the copy
-    // rather than the clone pointing at the original's trigger.
-    // `workflow_id`/`location_id`/`actions` are re-pointed in
-    // buildTriggerDocument, which knows the destination workflow.
-    const clonedTriggers: WorkflowTrigger[] = (source.triggers || []).map(t => {
-      const { id: _id, ...rest } = t;
-      const data = t.data
-        ? {
-            ...t.data,
-            targetActionId: t.data.targetActionId
-              ? idMap.get(t.data.targetActionId as string) || t.data.targetActionId
-              : undefined,
-          }
-        : undefined;
-      return { ...rest, type: t.type, ...(data ? { data } : {}) };
-    });
+    // Triggers are deliberately NOT cloned. A copy needs its own trigger
+    // document, and creating one is not supported — see
+    // triggerCreateUnsupported. Sending them would fail the entire clone, so
+    // the actions are cloned and the caller is told the trigger was skipped.
+    const skippedTriggers = (source.triggers || []).map(t => ({
+      type: t.type,
+      name: t.name,
+    }));
 
-    // Update with cloned data
-    return this.updateWorkflow(newId, {
-      actions: clonedActions,
-      triggers: clonedTriggers.length > 0 ? clonedTriggers : undefined,
-    });
+    const cloned = await this.updateWorkflow(newId, { actions: clonedActions });
+
+    return { ...cloned, skippedTriggers };
   }
 
   // ─── Helpers ────────────────────────────────────────────
 
   /**
+   * Reject a write that would have to CREATE a trigger, and say why.
+   *
+   * The workflow PUT can only ever UPDATE a trigger document — it never
+   * creates one. A save that references a trigger with no existing document
+   * fails with
+   *
+   *   5 NOT_FOUND: No document to update:
+   *   projects/highlevel-backend/databases/(default)/documents/triggers/<id>
+   *
+   * and takes the entire workflow write down with it. This holds even when no
+   * id is supplied and the backend mints its own (verified against the live
+   * API: a locally minted UUID and a backend-minted Firestore id fail
+   * identically). Trigger documents are stored separately — see the
+   * workflow's `triggersFilePath` — and the endpoint that creates one has not
+   * been identified, so this fails fast instead of leaving a half-written
+   * workflow behind.
+   *
+   * Returns null when every trigger already exists (has an id), which the PUT
+   * handles fine.
+   */
+  private static triggerCreateUnsupported(
+    triggers: WorkflowTrigger[] | undefined
+  ): string | null {
+    if (!triggers?.some(t => !t.id)) return null;
+    return WorkflowBuilderClient.triggerCreateHelp();
+  }
+
+  /** The explanation callers get when they ask for a trigger to be created. */
+  static triggerCreateHelp(): string {
+    return (
+      'Cannot create a workflow trigger through this API. GHL requires the trigger document ' +
+      'to already exist: the workflow save only UPDATEs triggers, and referencing one that ' +
+      'was never created fails with "5 NOT_FOUND: No document to update: ' +
+      '.../documents/triggers/<id>", rejecting the whole workflow. The endpoint that creates ' +
+      'a trigger document is not known. Add the trigger in the GHL UI, then reference it here ' +
+      'by its id to edit it. Writes that omit `triggers` entirely leave an existing trigger ' +
+      'untouched, so actions can still be updated safely on a triggered workflow.'
+    );
+  }
+
+  /**
    * Build the trigger document GHL actually stores.
    *
    * Previously this sent an invented shape — `{ id, type, name, workflowId,
-   * data: { type, targetActionId } }` — with a locally minted UUID. GHL has no
-   * such document, so the save failed with
-   * `5 NOT_FOUND: No document to update: .../documents/triggers/<uuid>`:
-   * supplying an id told the backend to UPDATE a trigger that had never been
-   * created, and the whole workflow write was rejected with it.
-   *
-   * A real trigger document looks like:
+   * data: { type, targetActionId } }` — with a locally minted UUID. GHL stores
+   * a snake_case document with no `data` field at all:
    *
    *   { id, workflow_id, location_id, type, name, active, deleted,
    *     conditions: [], actions: [{ type: 'add_to_workflow', workflow_id }],
    *     masterType: 'highlevel', belongs_to: 'workflow' }
    *
-   * `id` is therefore omitted unless the caller is editing a trigger that
-   * already exists — GHL mints it for new ones.
+   * Only reached for triggers that already exist —
+   * {@link triggerCreateUnsupported} rejects the create case — so `id` is
+   * always carried through.
    */
   private buildTriggerDocument(
     trigger: WorkflowTrigger,
