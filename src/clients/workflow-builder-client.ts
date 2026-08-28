@@ -20,7 +20,16 @@ export interface WorkflowAction {
   name: string;
   type: string;
   attributes?: Record<string, unknown>;
-  next?: string[];
+  /**
+   * Outgoing edge(s).
+   *  - Non-branching node: a SCALAR string (GHL rejects arrays here with
+   *    `non-branching-next-is-array`).
+   *  - Branch/router node (cat: 'conditions'/'multi-path', nodeType:
+   *    'condition-node'): an ARRAY of branch node IDs.
+   *  - Terminal node: omitted entirely (an empty array is still an array
+   *    and is rejected).
+   */
+  next?: string | string[];
   parentKey?: string;
   parent?: string;
   cat?: string;
@@ -452,23 +461,33 @@ export class WorkflowBuilderClient {
     const clonedActions: WorkflowAction[] = sourceTemplates.map(a => {
       const remapId = (id: string) => idMap.get(id) || id;
 
-      let nextArr: string[] | undefined;
-      if (Array.isArray(a.next)) {
-        nextArr = a.next.map(remapId);
-      } else {
-        nextArr = undefined;
-      }
+      // Remap `next` while preserving scalar-vs-array shape.
+      const next = Array.isArray(a.next)
+        ? a.next.map(remapId)
+        : typeof a.next === 'string' && a.next
+          ? remapId(a.next)
+          : undefined;
 
-      return {
+      const cloned: WorkflowAction = {
         ...a,
         id: a.id ? idMap.get(a.id) || randomUUID() : randomUUID(),
-        next: nextArr,
+        // Router branch IDs live inside attributes and must be remapped too,
+        // otherwise the clone's router still points at the ORIGINAL branch nodes.
+        attributes: WorkflowBuilderClient.remapAttributeIds(a.attributes, remapId),
         parentKey: a.parentKey ? remapId(a.parentKey) : undefined,
         parent: a.parent ? remapId(a.parent) : undefined,
         sibling: Array.isArray(a.sibling)
           ? a.sibling.map(remapId)
           : undefined,
       };
+
+      if (next === undefined) {
+        delete cloned.next;
+      } else {
+        cloned.next = next;
+      }
+
+      return cloned;
     });
 
     // Clone triggers with remapped targetActionId
@@ -494,6 +513,75 @@ export class WorkflowBuilderClient {
   // ─── Helpers ────────────────────────────────────────────
 
   /**
+   * Remap node-ID references that live inside an action's `attributes`.
+   *
+   * A router node stores its outgoing branches as
+   *   attributes.branches[] = [{ id: <branch node id>, name, segments: [...] }]
+   * and conditions may carry `ifElseNodeId`. Cloning previously copied
+   * `attributes` verbatim, so a cloned router still referenced the SOURCE
+   * workflow's branch node IDs — internally inconsistent.
+   *
+   * Only known ID-bearing keys are touched; everything else is passed through.
+   */
+  private static remapAttributeIds(
+    attributes: Record<string, unknown> | undefined,
+    remapId: (id: string) => string
+  ): Record<string, unknown> | undefined {
+    if (!attributes) return attributes;
+
+    const ID_KEYS = new Set(['id', 'ifElseNodeId', 'targetActionId', 'nodeId']);
+
+    const walk = (value: unknown): unknown => {
+      if (Array.isArray(value)) return value.map(walk);
+      if (value && typeof value === 'object') {
+        const out: Record<string, unknown> = {};
+        for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+          if (ID_KEYS.has(k) && typeof v === 'string' && v) {
+            out[k] = remapId(v);
+          } else {
+            out[k] = walk(v);
+          }
+        }
+        return out;
+      }
+      return value;
+    };
+
+    return walk(attributes) as Record<string, unknown>;
+  }
+
+  /**
+   * True when a node is a branch/router — the only kind of node for which
+   * GHL accepts an ARRAY in `next`. Everything else must use a scalar string.
+   */
+  private static isRouterNode(a: Partial<WorkflowAction>): boolean {
+    if (a.nodeType === 'condition-node') return true;
+    if (a.cat === 'multi-path') return true;
+    // A node fanning out to 2+ targets is a router by construction.
+    return Array.isArray(a.next) && a.next.length > 1;
+  }
+
+  /**
+   * Normalise a `next` value to what the GHL workflow validator expects.
+   *
+   *   router  -> string[]   (branch node IDs)
+   *   normal  -> string     (scalar — arrays are rejected)
+   *   terminal-> undefined  (key omitted; [] is still an array and is rejected)
+   */
+  private static normaliseNext(
+    value: string | string[] | undefined,
+    isRouter: boolean
+  ): string | string[] | undefined {
+    const ids = (Array.isArray(value) ? value : value ? [value] : []).filter(
+      (id): id is string => typeof id === 'string' && id.length > 0
+    );
+
+    if (ids.length === 0) return undefined; // terminal — omit `next` entirely
+    if (isRouter) return ids; // branch/router — array is required
+    return ids[0]; // non-branching — MUST be a scalar string
+  }
+
+  /**
    * Chain raw actions with next/parentKey linkages.
    * If actions already have next/parentKey set, preserves them (for branching).
    */
@@ -512,26 +600,34 @@ export class WorkflowBuilderClient {
       const hasExplicitNext = original.next !== undefined;
       const hasExplicitParent = original.parentKey !== undefined;
 
-      let nextArr: string[] | undefined;
-      if (hasExplicitNext) {
-        // Preserve arrays; normalise string "next" to a single-element array
-        if (Array.isArray(original.next)) {
-          nextArr = original.next;
-        } else if (typeof original.next === 'string' && original.next) {
-          nextArr = [original.next];
-        }
-      } else if (i < arr.length - 1) {
-        nextArr = [arr[i + 1].id!];
-      }
+      const isRouter = WorkflowBuilderClient.isRouterNode(original);
 
-      return {
-        ...a,
-        next: nextArr,
+      // Explicit linkage wins; otherwise auto-chain to the following action.
+      // The last action in the array is terminal and gets no `next` at all.
+      const rawNext: string | string[] | undefined = hasExplicitNext
+        ? original.next
+        : i < arr.length - 1
+          ? arr[i + 1].id!
+          : undefined;
+
+      const next = WorkflowBuilderClient.normaliseNext(rawNext, isRouter);
+
+      const node: WorkflowAction = {
+        ...(a as WorkflowAction),
         parentKey: hasExplicitParent
           ? a.parentKey
           : (i > 0 ? arr[i - 1].id : undefined),
       };
-    }).map(a => a as WorkflowAction);
+
+      // Omit the key entirely for terminals rather than emitting [] or null.
+      if (next === undefined) {
+        delete node.next;
+      } else {
+        node.next = next;
+      }
+
+      return node;
+    });
   }
 
   /**
