@@ -52,3 +52,16 @@ pids/
 tmp/
 temp/ 
 .vercel
+
+# ── Credential hygiene (added 2026-08-25, security cleanup) ──
+.env
+.env.*
+!.env.example
+env.txt
+.mcp.json
+.claude/settings.local.json
+*.pem
+*.key
+*credential*
+*secret*
+!*.example
