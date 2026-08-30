@@ -26,7 +26,10 @@ import {
   derivePipelineRoute,
   isUsableGhlId,
   buildCustomFieldPayload,
+  definiteText,
+  topRiskOf,
   RESULT_FIELDS,
+  NOTIFICATION_FIELDS,
   clearFieldCache,
 } from '../src/pae-writeback';
 import { resolveBuildInfo } from '../src/build-info';
@@ -296,6 +299,87 @@ describe('buildCustomFieldPayload', () => {
   it('clamps oversized text so a runaway reasoning field cannot fail the write', () => {
     const { customFields } = buildCustomFieldPayload({ verdict: 'x'.repeat(9000) }, ids);
     expect(String(customFields[0].field_value).length).toBeLessThanOrEqual(4000);
+  });
+});
+
+// ─── Alert-safe values ────────────────────────────────────────────────────────
+// Today's test proved the failure mode is a merge token rendering BLANK rather
+// than literal — "Verdict:" followed by nothing looks fine to a human skimming.
+// Anything that reaches a notification must therefore read as an answer.
+
+describe('definiteText — no field in an alert may render blank', () => {
+  it.each([
+    [undefined, 'None identified'],
+    [null, 'None identified'],
+    ['', 'None identified'],
+    ['   ', 'None identified'],
+    [[], 'None identified'],
+    [['', '  '], 'None identified'],
+  ])('turns %p into the fallback', (input, expected) => {
+    expect(definiteText(input, 'None identified')).toBe(expected);
+  });
+
+  it('keeps a real value and trims it', () => {
+    expect(definiteText('  Strong equity position  ', 'None')).toBe('Strong equity position');
+  });
+
+  it('joins a list rather than stringifying an array', () => {
+    expect(definiteText(['Deferred maintenance', 'Thin comps'], 'None')).toBe(
+      'Deferred maintenance | Thin comps'
+    );
+    expect(definiteText(['a', 'b'], 'None')).not.toContain('[');
+  });
+
+  it('drops empty entries when joining', () => {
+    expect(definiteText(['Real risk', '', null, 'Another'], 'None')).toBe(
+      'Real risk | Another'
+    );
+  });
+});
+
+describe('topRiskOf — one risk for the alert, not the whole list', () => {
+  it('takes the first risk', () => {
+    expect(topRiskOf(['Cap rate below market', 'Deferred maintenance'])).toBe(
+      'Cap rate below market'
+    );
+  });
+
+  it('says so definitely when there are no risks', () => {
+    expect(topRiskOf([])).toBe('None identified');
+    expect(topRiskOf(undefined)).toBe('None identified');
+    expect(topRiskOf('')).toBe('None identified');
+  });
+
+  it('skips blank leading entries rather than returning whitespace', () => {
+    expect(topRiskOf(['', '   ', 'Real risk'])).toBe('Real risk');
+  });
+
+  it('never returns an empty string', () => {
+    for (const input of [[], [''], ['  '], null, undefined, 0, false]) {
+      expect(topRiskOf(input).trim().length).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe('the notification field set', () => {
+  it('every field an alert renders has a place in the write-back', () => {
+    for (const key of NOTIFICATION_FIELDS) {
+      expect(RESULT_FIELDS[key]).toBeDefined();
+      expect(RESULT_FIELDS[key]).toMatch(/^paew2_/);
+    }
+  });
+
+  it('carries the analysis substance a person needs to triage', () => {
+    // The old notification carried only verdict, address, price, submitter and a
+    // dead pipeline_route — nothing you could act on without opening the card.
+    expect(NOTIFICATION_FIELDS).toEqual(
+      expect.arrayContaining(['verdict', 'compositeScore', 'reasoning', 'topRisk'])
+    );
+  });
+
+  it('exposes the full risk list and missing fields for the note', () => {
+    expect(RESULT_FIELDS.keyRisks).toBe('paew2_key_risks');
+    expect(RESULT_FIELDS.missingFields).toBe('paew2_missing_fields');
   });
 });
 

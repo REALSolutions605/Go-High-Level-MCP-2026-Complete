@@ -4,8 +4,10 @@ import type { Application, Request, Response } from 'express';
 import { loadBuyerProfiles, renderProfiles } from './pae-profiles.js';
 import {
   RESULT_FIELDS,
+  definiteText,
   derivePipelineRoute,
   isUsableGhlId,
+  topRiskOf,
   writeAnalysisFields,
   type AnalysisStatus,
   type ResultValues,
@@ -1322,7 +1324,9 @@ export function registerPAERoutes(app: Application, log: LogFn): void {
         status: analyzing,
         requestId,
         analysisTimestamp: new Date().toISOString(),
-        error: '',
+        // Definite, not blank: if the run dies here, the UNROUTED note renders
+        // this sentence rather than an empty line that reads like "no problem".
+        error: '(analysis in progress — no error recorded yet)',
       },
       log
     );
@@ -1408,18 +1412,27 @@ export function registerPAERoutes(app: Application, log: LogFn): void {
         return;
       }
 
+      const risks = (verdict.key_risks || sovereign.key_risks || []) as string[];
+
       const complete: AnalysisStatus = 'COMPLETE';
       const values: ResultValues = {
         status: complete,
         verdict: decision,
         pipelineRoute: derivePipelineRoute(decision),
         compositeScore: Number(sovereign.composite_score ?? 0) || 0,
-        reasoning: String(verdict.reasoning ?? sovereign.reasoning ?? ''),
-        keyRisks: ((verdict.key_risks || sovereign.key_risks || []) as string[]).join(' | '),
+        // Fields that reach an internal notification carry a definite value, so
+        // an absent one reads as an answer instead of rendering blank.
+        reasoning: definiteText(
+          verdict.reasoning ?? sovereign.reasoning,
+          'No reasoning returned by the analysis.'
+        ),
+        topRisk: topRiskOf(risks),
+        keyRisks: definiteText(risks, 'None identified'),
         dataCompleteness: Number(inputSummary.data_completeness_pct ?? 0) || 0,
+        missingFields: definiteText(inputSummary.missing_fields, 'None reported'),
         analysisTimestamp: String(analysis.analysis_timestamp ?? new Date().toISOString()),
         requestId,
-        error: '',
+        error: 'None',
       };
 
       const write = await writeAnalysisFields(opportunityId, values, log);

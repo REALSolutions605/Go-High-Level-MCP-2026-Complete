@@ -80,11 +80,33 @@ a field in GHL does not silently break the write-back.
 | `paew2_composite_score` | `32vRbfHzhtYDPsyKU4os` | NUMERICAL | sovereign composite score |
 | `paew2_pipeline_route` | `WN3d2tSJYnXzzqc0haj2` | TEXT | mirrors the verdict; UNROUTED for anything unrecognised |
 | `paew2_reasoning` | `Bis3dozgy9K2woBuGuNW` | LARGE_TEXT | verdict reasoning |
-| `paew2_key_risks` | `HAMdLbRXwF34pSa55uWT` | LARGE_TEXT | pipe-joined risk list |
+| `paew2_key_risks` | `HAMdLbRXwF34pSa55uWT` | LARGE_TEXT | pipe-joined risk list (for the note) |
+| `paew2_top_risk` | `3McriEh22DsIshQsuVTr` | TEXT | single highest risk (for the alert) |
 | `paew2_data_completeness` | `x1fLsUvOixnaTqVtkQFK` | NUMERICAL | percent of fields populated |
+| `paew2_missing_fields` | `olHwfbwaATZPb6nnSaMi` | LARGE_TEXT | fields the analysis wanted and did not get |
 | `paew2_analysis_timestamp` | `NYoSdSUG9O8gtVOnH5s0` | TEXT | ISO 8601 |
 | `paew2_request_id` | `CdXWhmWlkilYkZjVWrUu` | TEXT | ties the card to a run and to the acknowledgement |
-| `paew2_error` | `EwUrys6gHRGr1x0uSLFG` | LARGE_TEXT | populated only on FAILED |
+| `paew2_error` | `EwUrys6gHRGr1x0uSLFG` | LARGE_TEXT | always definite; `None` on success |
+
+### Fields that reach an alert are never blank
+
+A merge token pointing at an empty field renders as **nothing**, and "Verdict:"
+followed by nothing reads as fine to someone skimming. That is worse than a
+literal token, which at least looks broken. So every field that appears in a
+notification is written with a definite value:
+
+| Field | When the analysis has nothing |
+|---|---|
+| `paew2_reasoning` | `No reasoning returned by the analysis.` |
+| `paew2_top_risk` | `None identified` |
+| `paew2_key_risks` | `None identified` |
+| `paew2_missing_fields` | `None reported` |
+| `paew2_error` | `None` on success; `(analysis in progress — no error recorded yet)` while running |
+
+PAE-W2 does the same at the QUEUED stamp, writing `Analysis has not run yet.`
+into the same fields — so a card that never got past QUEUED renders sentences,
+not empty space. `definiteText()` and `topRiskOf()` in `src/pae-writeback.ts`
+enforce this, and are unit-tested for it.
 
 ## Making failure visible
 
@@ -143,6 +165,75 @@ the same opportunity record, each silently renaming the last.
 
 PASS gets no notification, per the engine's Section 7 rule 6 ("PASS is silent").
 It still gets a card and a note, because the card already exists by then.
+
+## Notification, note, card — the division of labour
+
+- **Notification** — enough to decide whether to act, without opening anything.
+- **Note** — the whole analysis.
+- **Card** — the structured fields, queryable and filterable.
+
+Every analysis value in both comes from an `{{opportunity.paew2_*}}` custom
+field. Nothing reads `{{custom_webhook.N.response.*}}` any more — those are the
+tokens that rendered blank, and there are now zero of them in the workflow.
+
+**Alert** (all four notifying branches) leads with the decision:
+
+```
+PROCEED · 62/100 · 18900 Fairport St
+  Verdict: PROCEED · Score: 62/100
+  Why:  <reasoning>
+  Top risk: <single highest risk>
+  18900 Fairport St · Asking $2,250,000
+  From: <submitter>
+```
+
+`pipeline_route` is deliberately **not** in the alert. It carries real
+information now, but in a short alert it only restates the verdict. It stays in
+the note.
+
+**Note** adds: analysis status, pipeline route, the full key-risk list, data
+completeness, missing fields, error, timestamp, request id, and asset class.
+
+**The UNROUTED alert reports the absence of a verdict as the finding.** It does
+not render verdict/score/reasoning — those are exactly the fields with nothing
+in them — and instead leads with "No verdict was stored for this deal. Nothing
+was decided. This is NOT a PASS.", then shows `paew2_status` with a legend for
+what each value means, plus `paew2_error` and the request id to grep Railway
+logs with.
+
+### Who gets notified
+
+Steven only, for now.
+
+| Channel | Targeting | Status |
+|---|---|---|
+| In-app | `notification: { type: "send_notification", userType: "user", selectedUser: "CQjAW9lECxfufIUTdJPK" }` | **Working** — verified shape |
+| Email | top-level `userType: "all"` | **Still all users** — see below |
+
+The in-app shape is not a guess: CS-W2, CS-W4, CS-W7 and D4D Property Tracker
+are published workflows in this same location that all target this exact user id
+this exact way.
+
+`CQjAW9lECxfufIUTdJPK` is Steven Buysman, admin. Note his GHL account email is
+**`realsolutions605@gmail.com`** — there is no user on this location with the
+address `Steven@real-solutions-llc.com`.
+
+**The email channel is still going to all five users.** Every
+`internal_notification` in this location that carries an email block uses a
+top-level `userType` of `all` or `assign`; there is no observed example of a
+specific-user email target. The symmetric guess (top-level `userType: "user"` +
+`selectedUser`) is precisely the kind of configuration that can look right and
+reach nobody, so it was not invented. `assign` was also rejected — PAE-W2 sets
+no assignee, so it would resolve to nobody.
+
+To close it: set **one** notification to a specific user **with email enabled**
+in the GHL UI, read the action back with `ghl_get_workflow_full`, and copy the
+real shape into `NOTIFY.emailUserType` in `scripts/pae-w2-workflow.mjs`.
+
+To add team members later: `selectedUser` is singular, so either duplicate the
+notification node with a second id, or switch `NOTIFY.inApp.userType` to `all`
+or `assign`. The recipient is defined once in `NOTIFY` rather than at each of
+the four notification sites.
 
 ## The deal payload
 

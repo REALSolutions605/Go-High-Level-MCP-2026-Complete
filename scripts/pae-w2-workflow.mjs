@@ -52,9 +52,53 @@ const CF = {
   reasoning:         'Bis3dozgy9K2woBuGuNW', // paew2_reasoning
   key_risks:         'HAMdLbRXwF34pSa55uWT', // paew2_key_risks
   data_completeness: 'x1fLsUvOixnaTqVtkQFK', // paew2_data_completeness
+  top_risk:          '3McriEh22DsIshQsuVTr', // paew2_top_risk
   analysis_ts:       'NYoSdSUG9O8gtVOnH5s0', // paew2_analysis_timestamp
   request_id:        'CdXWhmWlkilYkZjVWrUu', // paew2_request_id
+  missing_fields:    'olHwfbwaATZPb6nnSaMi', // paew2_missing_fields
   error:             'EwUrys6gHRGr1x0uSLFG', // paew2_error
+};
+
+// ── Notification targeting ────────────────────────────────────────────────────
+// Steven is the sole recipient for now; team members are expected later, so the
+// recipient lives here rather than being spelled out at each of the four
+// notification sites.
+//
+// The in-app channel CAN target one user, and this is a verified shape, not a
+// guess: CS-W2, CS-W4, CS-W7 and D4D Property Tracker are published workflows in
+// this same location that all target this exact user id this exact way.
+//
+//   notification: { type: 'send_notification', userType: 'user',
+//                   selectedUser: '<user id>' }
+//
+// The EMAIL channel is a different story — see EMAIL_USER_TYPE below.
+//
+// To add a team member later: `selectedUser` is singular, so either duplicate
+// the notification node with a second id, or switch inApp.userType to 'all'
+// (everyone) or 'assign' (the assigned user).
+const NOTIFY = {
+  inApp: {
+    userType: 'user',
+    // Steven Buysman, admin on T0EYPXXzbxqjVy81nxnW. Resolved via get_users.
+    // NB: his GHL account email is realsolutions605@gmail.com — there is no
+    // user on this location with the address Steven@real-solutions-llc.com.
+    selectedUser: 'CQjAW9lECxfufIUTdJPK',
+  },
+  // Email recipients. Left at 'all' deliberately.
+  //
+  // Every internal_notification in this location that carries an email block
+  // uses a top-level userType of 'all' or 'assign' — there is NO observed
+  // example of a specific-user email target, and the symmetric guess
+  // (top-level userType 'user' + selectedUser) is exactly the kind of
+  // configuration that can look right and reach nobody. That is the failure
+  // class this whole project exists to eliminate, so it is not being invented
+  // here. 'assign' was also rejected: PAE-W2 sets no assignee, so it would
+  // resolve to nobody.
+  //
+  // To close this: set ONE notification to a specific user WITH email enabled
+  // in the GHL UI, then read the action back with ghl_get_workflow_full and
+  // copy the real shape here.
+  emailUserType: 'all',
 };
 
 // Stable node IDs so re-running this is idempotent.
@@ -169,23 +213,70 @@ const updateOpp = (id, name, parentKey, next, fields) => ({
   },
 });
 
-/** The analysis block every routed branch shares, rendered as HTML. */
-const ANALYSIS_HTML =
-  '<p><strong>Verdict:</strong> {{opportunity.paew2_verdict}}</p>' +
-  '<p><strong>Analysis status:</strong> {{opportunity.paew2_status}}</p>' +
-  '<p><strong>Composite score:</strong> {{opportunity.paew2_composite_score}}</p>' +
-  '<p><strong>Pipeline route:</strong> {{opportunity.paew2_pipeline_route}}</p>' +
-  '<p><strong>Data completeness:</strong> {{opportunity.paew2_data_completeness}}%</p>' +
-  '<p><strong>Reasoning:</strong> {{opportunity.paew2_reasoning}}</p>' +
-  '<p><strong>Key risks:</strong> {{opportunity.paew2_key_risks}}</p>' +
-  '<p><strong>Analysed at:</strong> {{opportunity.paew2_analysis_timestamp}} ' +
-  '(request {{opportunity.paew2_request_id}})</p>' +
+// ── Notification vs note: the division of labour ──────────────────────────────
+// The notification tells you enough to decide whether to act. The note holds the
+// whole analysis. The card holds the structured fields.
+//
+// Every analysis token below is an {{opportunity.paew2_*}} custom field written
+// by the async analyzer. None of them come from the webhook response any more —
+// that response is an acknowledgement and carries no verdict. The old
+// {{custom_webhook.1.response.*}} tokens are what rendered BLANK in testing.
+//
+// The server writes a definite value into every field that appears in a
+// notification ("None identified", "No reasoning returned by the analysis."),
+// so an absent value reads as an answer rather than as empty space.
+
+/**
+ * The alert body: decision first, then enough substance to triage without
+ * opening the card.
+ *
+ * Deliberately omits pipeline_route — it now carries real information, but in a
+ * short alert it only restates the verdict. It stays in the note.
+ */
+const ALERT_HTML = (routeLine) =>
+  `<p><strong>${routeLine}</strong></p>` +
+  '<p><strong>Verdict:</strong> {{opportunity.paew2_verdict}} &nbsp;·&nbsp; ' +
+  '<strong>Score:</strong> {{opportunity.paew2_composite_score}}/100</p>' +
+  '<p><strong>Why:</strong> {{opportunity.paew2_reasoning}}</p>' +
+  '<p><strong>Top risk:</strong> {{opportunity.paew2_top_risk}}</p>' +
+  '<hr>' +
   '<p><strong>Property:</strong> {{inboundWebhookRequest.property_address}}</p>' +
   '<p><strong>Asking price:</strong> {{inboundWebhookRequest.asking_price}}</p>' +
   '<p><strong>Submitter:</strong> {{inboundWebhookRequest.submitter_name}} ' +
   '({{inboundWebhookRequest.submitter_email}})</p>';
 
-const notify = (id, name, parentKey, next, subject, routeLine) => ({
+/** The push/in-app body. Same substance, no markup, short enough to read on a phone. */
+const ALERT_TEXT = (routeLine) =>
+  `${routeLine}\n` +
+  'Verdict: {{opportunity.paew2_verdict}} · Score: {{opportunity.paew2_composite_score}}/100\n' +
+  'Why: {{opportunity.paew2_reasoning}}\n' +
+  'Top risk: {{opportunity.paew2_top_risk}}\n' +
+  '{{inboundWebhookRequest.property_address}} · Asking {{inboundWebhookRequest.asking_price}}\n' +
+  'From: {{inboundWebhookRequest.submitter_name}}';
+
+/** The note: the complete record, including everything the alert leaves out. */
+const FULL_RECORD_HTML = (routeLine) =>
+  `<p><strong>Routing decision:</strong> ${routeLine}</p>` +
+  '<p><strong>Verdict:</strong> {{opportunity.paew2_verdict}}</p>' +
+  '<p><strong>Composite score:</strong> {{opportunity.paew2_composite_score}}/100</p>' +
+  '<p><strong>Analysis status:</strong> {{opportunity.paew2_status}}</p>' +
+  '<p><strong>Pipeline route:</strong> {{opportunity.paew2_pipeline_route}}</p>' +
+  '<p><strong>Reasoning:</strong> {{opportunity.paew2_reasoning}}</p>' +
+  '<p><strong>Top risk:</strong> {{opportunity.paew2_top_risk}}</p>' +
+  '<p><strong>All key risks:</strong> {{opportunity.paew2_key_risks}}</p>' +
+  '<p><strong>Data completeness:</strong> {{opportunity.paew2_data_completeness}}%</p>' +
+  '<p><strong>Missing fields:</strong> {{opportunity.paew2_missing_fields}}</p>' +
+  '<p><strong>Error:</strong> {{opportunity.paew2_error}}</p>' +
+  '<p><strong>Analysed at:</strong> {{opportunity.paew2_analysis_timestamp}} ' +
+  '(request {{opportunity.paew2_request_id}})</p>' +
+  '<hr>' +
+  '<p><strong>Property:</strong> {{inboundWebhookRequest.property_address}}</p>' +
+  '<p><strong>Asking price:</strong> {{inboundWebhookRequest.asking_price}}</p>' +
+  '<p><strong>Asset class:</strong> {{inboundWebhookRequest.asset_class}}</p>' +
+  '<p><strong>Submitter:</strong> {{inboundWebhookRequest.submitter_name}} ' +
+  '({{inboundWebhookRequest.submitter_email}})</p>';
+
+const notify = (id, name, parentKey, next, subject, routeLine, opts = {}) => ({
   id,
   type: 'internal_notification',
   name,
@@ -193,26 +284,25 @@ const notify = (id, name, parentKey, next, subject, routeLine) => ({
   next,
   attributes: {
     type: 'notification',
-    userType: 'all',
+    userType: NOTIFY.emailUserType,
     email: {
       subject,
-      html: `<p><strong>Routing decision:</strong> ${routeLine}</p>` + ANALYSIS_HTML,
+      html: opts.html || ALERT_HTML(routeLine),
     },
     sms: { body: '' },
     whatsapp: { body: '' },
     notification: {
+      type: 'send_notification',
       title: subject,
-      body:
-        'Verdict: {{opportunity.paew2_verdict}} | Status: {{opportunity.paew2_status}} | ' +
-        'Score: {{opportunity.paew2_composite_score}} | ' +
-        'From: {{inboundWebhookRequest.submitter_name}}',
+      body: opts.text || ALERT_TEXT(routeLine),
       redirectPage: 'opportunity',
-      userType: 'all',
+      userType: NOTIFY.inApp.userType,
+      selectedUser: NOTIFY.inApp.selectedUser,
     },
   },
 });
 
-const note = (id, name, parentKey, color, title, routeLine) => ({
+const note = (id, name, parentKey, color, title, routeLine, html) => ({
   id,
   type: 'add_notes',
   name,
@@ -222,7 +312,7 @@ const note = (id, name, parentKey, color, title, routeLine) => ({
     type: 'add_notes',
     color,
     title,
-    html: `<p><strong>Routing decision:</strong> ${routeLine}</p>` + ANALYSIS_HTML,
+    html: html || FULL_RECORD_HTML(routeLine),
   },
 });
 
@@ -316,11 +406,16 @@ const actions = [
   // ── 3. Stamp QUEUED before calling out ─────────────────────────────────────
   // Written by GHL, not by the server, so a card that never reached
   // /pae/analyze is distinguishable from one whose analysis died mid-run.
+  // Fields that appear in an alert get a definite value here too, so a card
+  // stuck at QUEUED renders sentences rather than empty lines.
   updateOpp(N.markQueued, 'PAE — Mark Analysis Queued', N.createOpp, N.webhook, [
     cif(`custom_fields.${CF.status}`, 'QUEUED', { dataType: 'TEXT', valueFieldType: 'string' }),
     cif(`custom_fields.${CF.verdict}`, '', { dataType: 'TEXT', valueFieldType: 'string' }),
     cif(`custom_fields.${CF.pipeline_route}`, '', { dataType: 'TEXT', valueFieldType: 'string' }),
-    cif(`custom_fields.${CF.error}`, '', { dataType: 'TEXT', valueFieldType: 'textarea' }),
+    cif(`custom_fields.${CF.error}`, '(not started — queued, webhook not yet answered)', { dataType: 'TEXT', valueFieldType: 'textarea' }),
+    cif(`custom_fields.${CF.reasoning}`, 'Analysis has not run yet.', { dataType: 'TEXT', valueFieldType: 'textarea' }),
+    cif(`custom_fields.${CF.top_risk}`, 'Analysis has not run yet.', { dataType: 'TEXT', valueFieldType: 'string' }),
+    cif(`custom_fields.${CF.missing_fields}`, 'Analysis has not run yet.', { dataType: 'TEXT', valueFieldType: 'textarea' }),
   ]),
 
   // ── 4. Fire and forget ─────────────────────────────────────────────────────
@@ -428,7 +523,7 @@ const actions = [
     'PROCEED — Notify Steven',
     BODY.PROCEED[0],
     BODY.PROCEED[2],
-    'PAE PROCEED — {{inboundWebhookRequest.property_address}}',
+    'PROCEED · {{opportunity.paew2_composite_score}}/100 · {{inboundWebhookRequest.property_address}}',
     'PROCEED — moved to the PROCEED stage of the Deal Flow pipeline.'
   ),
   note(
@@ -436,7 +531,7 @@ const actions = [
     'PROCEED — Add Analysis Note',
     BODY.PROCEED[1],
     '#D5F5E3',
-    'PAE PROCEED — {{inboundWebhookRequest.property_address}}',
+    'PROCEED · {{opportunity.paew2_composite_score}}/100 · {{inboundWebhookRequest.property_address}}',
     'PROCEED — moved to the PROCEED stage of the Deal Flow pipeline.'
   ),
 
@@ -457,7 +552,7 @@ const actions = [
     'WHOLESALE — Notify Steven',
     BODY.WHOLESALE[0],
     BODY.WHOLESALE[2],
-    'PAE WHOLESALE — {{inboundWebhookRequest.property_address}}',
+    'WHOLESALE · {{opportunity.paew2_composite_score}}/100 · {{inboundWebhookRequest.property_address}}',
     'WHOLESALE — moved to the WHOLESALE stage of the Deal Flow pipeline.'
   ),
   note(
@@ -465,7 +560,7 @@ const actions = [
     'WHOLESALE — Add Analysis Note',
     BODY.WHOLESALE[1],
     '#FCF3CF',
-    'PAE WHOLESALE — {{inboundWebhookRequest.property_address}}',
+    'WHOLESALE · {{opportunity.paew2_composite_score}}/100 · {{inboundWebhookRequest.property_address}}',
     'WHOLESALE — moved to the WHOLESALE stage of the Deal Flow pipeline.'
   ),
 
@@ -486,7 +581,7 @@ const actions = [
     'REVIEW — Notify Steven',
     BODY.REVIEW[0],
     BODY.REVIEW[2],
-    'PAE REVIEW — {{inboundWebhookRequest.property_address}}',
+    'REVIEW · {{opportunity.paew2_composite_score}}/100 · {{inboundWebhookRequest.property_address}}',
     'REVIEW — held in the REVIEW stage for human judgement.'
   ),
   note(
@@ -494,7 +589,7 @@ const actions = [
     'REVIEW — Add Analysis Note',
     BODY.REVIEW[1],
     '#D6EAF8',
-    'PAE REVIEW — {{inboundWebhookRequest.property_address}}',
+    'REVIEW · {{opportunity.paew2_composite_score}}/100 · {{inboundWebhookRequest.property_address}}',
     'REVIEW — held in the REVIEW stage for human judgement.'
   ),
 
@@ -518,7 +613,7 @@ const actions = [
     'PASS — Add Analysis Note',
     BODY.PASS[0],
     '#EAEDED',
-    'PAE PASS — {{inboundWebhookRequest.property_address}}',
+    'PASS · {{opportunity.paew2_composite_score}}/100 · {{inboundWebhookRequest.property_address}}',
     'PASS — analysis completed and found no acquisition or disposition path. ' +
       'No notification sent (PASS is silent by design). This is a FINISHED ' +
       'analysis, not a missing one: paew2_status reads COMPLETE.'
@@ -545,16 +640,42 @@ const actions = [
       cif('source', 'Pre-Analysis Engine — UNROUTED', { dataType: 'TEXT', valueFieldType: 'string' }),
     ]
   ),
+  // The UNROUTED alert must never present empty fields as a result. It reports
+  // the ABSENCE of a verdict as the finding, and renders status and error —
+  // both of which the server keeps definite — instead of verdict/score/reasoning,
+  // which are exactly the fields that have nothing in them here.
   notify(
     BODY.NONE[1],
     'UNROUTED — Notify Steven (analysis did not complete)',
     BODY.NONE[0],
     BODY.NONE[2],
-    'PAE UNROUTED — ANALYSIS DID NOT COMPLETE — {{inboundWebhookRequest.property_address}}',
-    'UNROUTED — no verdict was stored on this opportunity. Read ' +
-      '<strong>Analysis status</strong> below: QUEUED means /pae/analyze was never ' +
-      'reached, ANALYZING means the run died mid-analysis, FAILED means it errored ' +
-      '(see the error field). This is NOT a PASS — nothing was decided.'
+    'NO VERDICT — analysis did not complete · {{inboundWebhookRequest.property_address}}',
+    '',
+    {
+      html:
+        '<p><strong>No verdict was stored for this deal. Nothing was decided. ' +
+        'This is NOT a PASS.</strong></p>' +
+        '<p><strong>Analysis status:</strong> {{opportunity.paew2_status}}<br>' +
+        '<em>QUEUED</em> = /pae/analyze was never reached · ' +
+        '<em>ANALYZING</em> = the run died mid-analysis · ' +
+        '<em>FAILED</em> = it errored, see below.</p>' +
+        '<p><strong>Error:</strong> {{opportunity.paew2_error}}</p>' +
+        '<p><strong>Request id:</strong> {{opportunity.paew2_request_id}}</p>' +
+        '<hr>' +
+        '<p>Card parked in REVIEW, source "Pre-Analysis Engine — UNROUTED", ' +
+        'awaiting manual routing.</p>' +
+        '<p><strong>Property:</strong> {{inboundWebhookRequest.property_address}}</p>' +
+        '<p><strong>Asking price:</strong> {{inboundWebhookRequest.asking_price}}</p>' +
+        '<p><strong>Submitter:</strong> {{inboundWebhookRequest.submitter_name}} ' +
+        '({{inboundWebhookRequest.submitter_email}})</p>',
+      text:
+        'NO VERDICT — nothing was decided. This is NOT a PASS.\n' +
+        'Analysis status: {{opportunity.paew2_status}}\n' +
+        'Error: {{opportunity.paew2_error}}\n' +
+        '{{inboundWebhookRequest.property_address}} · Asking {{inboundWebhookRequest.asking_price}}\n' +
+        'From: {{inboundWebhookRequest.submitter_name}}\n' +
+        'Card parked in REVIEW for manual routing.',
+    }
   ),
   {
     id: BODY.NONE[2],
@@ -565,20 +686,29 @@ const actions = [
     attributes: {
       type: 'add_notes',
       color: '#FADBD8',
-      title: 'PAE UNROUTED — ANALYSIS DID NOT COMPLETE — {{inboundWebhookRequest.property_address}}',
+      title: 'NO VERDICT — analysis did not complete · {{inboundWebhookRequest.property_address}}',
       html:
         '<p><strong>Routing decision:</strong> UNROUTED — no verdict was stored on ' +
         'this opportunity, so none of the PROCEED / WHOLESALE / REVIEW / PASS branches ' +
         'matched. <strong>This is not a PASS.</strong> Nothing was decided about this ' +
         'deal.</p>' +
-        '<p><strong>Analysis status:</strong> {{opportunity.paew2_status}} — QUEUED ' +
-        'means /pae/analyze was never reached, ANALYZING means the run died mid-flight, ' +
-        'FAILED means it errored.</p>' +
+        '<p><strong>Analysis status:</strong> {{opportunity.paew2_status}}<br>' +
+        '<em>QUEUED</em> = PAE-W2 stamped the card but /pae/analyze was never reached.<br>' +
+        '<em>ANALYZING</em> = the endpoint accepted the work and the run died before ' +
+        'writing a verdict.<br>' +
+        '<em>FAILED</em> = the run ended in a handled error; see Error below.<br>' +
+        '<em>(blank)</em> = the workflow never reached the stamping step at all.</p>' +
         '<p><strong>Error:</strong> {{opportunity.paew2_error}}</p>' +
-        '<p><strong>Request id:</strong> {{opportunity.paew2_request_id}}</p>' +
-        '<p><strong>Verdict field (should be empty):</strong> {{opportunity.paew2_verdict}}</p>' +
+        '<p><strong>Request id:</strong> {{opportunity.paew2_request_id}} — search the ' +
+        'Railway logs for this to find the run.</p>' +
+        '<p><strong>Last written at:</strong> {{opportunity.paew2_analysis_timestamp}}</p>' +
+        '<hr>' +
+        '<p>Card parked in REVIEW with source "Pre-Analysis Engine — UNROUTED" for ' +
+        'manual routing. Re-submitting the deal will start a fresh analysis on a new ' +
+        'card.</p>' +
         '<p><strong>Property:</strong> {{inboundWebhookRequest.property_address}}</p>' +
         '<p><strong>Asking price:</strong> {{inboundWebhookRequest.asking_price}}</p>' +
+        '<p><strong>Asset class:</strong> {{inboundWebhookRequest.asset_class}}</p>' +
         '<p><strong>Submitter:</strong> {{inboundWebhookRequest.submitter_name}} ' +
         '({{inboundWebhookRequest.submitter_email}})</p>',
     },

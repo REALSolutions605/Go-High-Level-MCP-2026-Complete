@@ -41,11 +41,52 @@ export const RESULT_FIELDS = {
   pipelineRoute: `${PREFIX}pipeline_route`,
   reasoning: `${PREFIX}reasoning`,
   keyRisks: `${PREFIX}key_risks`,
+  /** Single highest-priority risk, for the alert. The full list is keyRisks. */
+  topRisk: `${PREFIX}top_risk`,
   dataCompleteness: `${PREFIX}data_completeness`,
+  missingFields: `${PREFIX}missing_fields`,
   analysisTimestamp: `${PREFIX}analysis_timestamp`,
   requestId: `${PREFIX}request_id`,
   error: `${PREFIX}error`,
 } as const;
+
+/**
+ * Fields rendered into an internal notification, where a blank is dangerous.
+ *
+ * Today's test proved the failure mode is a merge token rendering BLANK rather
+ * than literal — a note that reads "Verdict:" followed by nothing looks fine to
+ * a human skimming it. Any field that appears in an alert therefore gets a
+ * definite value rather than an empty string. See {@link definiteText}.
+ */
+export const NOTIFICATION_FIELDS: ReadonlyArray<ResultFieldKeyName> = [
+  'verdict',
+  'compositeScore',
+  'reasoning',
+  'topRisk',
+];
+
+type ResultFieldKeyName = keyof typeof RESULT_FIELDS;
+
+/**
+ * Coerce a value destined for an alert into something that always reads as an
+ * answer. An empty reasoning field must say so, not render as whitespace.
+ */
+export function definiteText(value: unknown, whenEmpty: string): string {
+  if (value === null || value === undefined) return whenEmpty;
+  const s = Array.isArray(value)
+    ? value.filter((x) => x !== null && x !== undefined && String(x).trim()).join(' | ')
+    : String(value);
+  return s.trim() ? s.trim() : whenEmpty;
+}
+
+/** First entry of a key-risk list, or a definite statement that there is none. */
+export function topRiskOf(risks: unknown): string {
+  if (Array.isArray(risks)) {
+    const first = risks.find((r) => r !== null && r !== undefined && String(r).trim());
+    return first ? String(first).trim() : 'None identified';
+  }
+  return definiteText(risks, 'None identified');
+}
 
 export type ResultFieldKey = keyof typeof RESULT_FIELDS;
 
