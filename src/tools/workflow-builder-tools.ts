@@ -248,6 +248,20 @@ export class WorkflowBuilderTools {
               enum: ['draft', 'published'],
               description: 'Set workflow status',
             },
+            allowMultipleOpportunity: {
+              type: 'boolean',
+              description:
+                "GHL's \"Allow Multiple Opportunities\" setting. When false, a create_opportunity " +
+                "action UPDATES the contact's existing opportunity in that pipeline instead of " +
+                'creating a new one, so repeat submissions from the same contact collapse into ' +
+                'a single card. Omit to preserve the workflow\'s current value.',
+            },
+            allowMultiple: {
+              type: 'boolean',
+              description:
+                'Whether a contact can be enrolled in this workflow more than once. ' +
+                'Omit to preserve the current value.',
+            },
           },
           required: ['workflowId'],
           additionalProperties: false,
@@ -466,6 +480,8 @@ export class WorkflowBuilderTools {
       actions: params.actions as WorkflowAction[] | undefined,
       triggers: params.triggers as WorkflowTrigger[] | undefined,
       status: params.status as 'draft' | 'published' | undefined,
+      allowMultipleOpportunity: params.allowMultipleOpportunity as boolean | undefined,
+      allowMultiple: params.allowMultiple as boolean | undefined,
     });
 
     return success({
@@ -474,6 +490,7 @@ export class WorkflowBuilderTools {
       name: workflow.name,
       status: workflow.status,
       version: workflow.version,
+      allowMultipleOpportunity: workflow.allowMultipleOpportunity,
       actionCount: workflow.workflowData?.templates?.length || 0,
       actions: (workflow.workflowData?.templates || []).map((t, i) => ({
         order: i,

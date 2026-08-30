@@ -1,9 +1,28 @@
 import * as https from 'https';
+import { randomUUID } from 'crypto';
 import type { Application, Request, Response } from 'express';
+import { loadBuyerProfiles, renderProfiles } from './pae-profiles.js';
+import {
+  RESULT_FIELDS,
+  derivePipelineRoute,
+  isUsableGhlId,
+  writeAnalysisFields,
+  type AnalysisStatus,
+  type ResultValues,
+} from './pae-writeback.js';
 
 // ─── PAE Webhook Handler ──────────────────────────────────────────────────────
-// Pre-Analysis Engine endpoint called by GHL Custom Webhook action.
-// Accepts deal data JSON, calls Claude API internally, returns verdict JSON.
+// Pre-Analysis Engine endpoint called by GHL's Custom Webhook action.
+//
+// ASYNCHRONOUS. The analysis takes 27-38 seconds; GHL's custom-webhook action
+// times out well before that, so returning the verdict in the HTTP response
+// could never work — `custom_webhook.1.response.verdict` was always empty and
+// every deal fell to the router's None catch-all while looking like a clean run.
+//
+// /pae/analyze now validates the payload, acknowledges within a second, and
+// runs the analysis afterwards, writing the result onto the OPPORTUNITY as
+// `paew2_*` custom fields. PAE-W2 waits, then routes on the stored field.
+//
 // Auth: x-pae-secret header matched against PAE_WEBHOOK_SECRET env var.
 // Registered BEFORE the MCP bearer-token middleware so GHL can reach it.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -155,7 +174,7 @@ You will receive deal data as a structured payload in the user message. The data
 
 Not all deals will arrive with complete data. This is expected. Your job is to work with what you have and be explicit about what you do not have.
 
-- If fewer than 5 of the financial fields are present (\`asking_price\`, \`estimated_value\`, \`monthly_rent_actual\`, \`monthly_rent_market\`, \`annual_noi\`, \`cap_rate\`, \`mortgage_balance\`, \`seller_equity_pct\`, \`rehab_estimate\`, \`cash_flow_per_door\`), the deal cannot receive a PROCEED or WHOLESALE verdict. Route to REVIEW with a clear list of missing data needed.
+- If fewer than 5 of the financial fields are present (\`asking_price\`, \`estimated_value\`, \`monthly_rent_actual\`, \`monthly_rent_market\`, \`annual_noi\`, \`cap_rate\`, \`mortgage_balance\`, \`seller_equity_pct\`, \`rehab_estimate\`, \`cash_flow_per_door\`), the deal cannot receive a PROCEED or WHOLESALE verdict. Route to REVIEW with a clear list of missing data needed. **The engine counts these fields for you and states the result in the user message as \`financial_fields_present\` and \`financial_gate_satisfied\`. Use those values — do not re-count the fields yourself, and do not treat a field as missing because it is unfamiliar. When \`financial_gate_satisfied\` is true this gate does not block a PROCEED or WHOLESALE verdict.**
 
 - If \`property_address\` and \`asset_class\` are both missing, route to REVIEW immediately — there is not enough information to evaluate.
 
@@ -1051,7 +1070,200 @@ SPECIAL_RULES:
 - REVIEW verdicts must include submitter contact protocol in follow_up_actions (Document 1, Section 6.8)
 --- END BUY BOX PROFILE ---`;
 
+// ── Deal payload projection ───────────────────────────────────────────────────
+// The handler used to project req.body onto a fixed 20-key allowlist and drop
+// everything else without a word. Real deals carry annual_noi, cap_rate,
+// mortgage_balance, property_taxes, insurance_estimate, occupancy_rate,
+// revenue_current, operating_expenses, monthly_rent_actual, seller_equity_pct,
+// condition and financing_terms — all silently discarded. Crazy Horse missed
+// PROCEED at 62 listing exactly those in its own `missing_fields`, on a property
+// with five years of P&Ls on file.
+//
+// The canonical list below covers every field the system prompt's Section 1
+// table names, and anything else the caller sends is passed through as an extra
+// rather than dropped.
+
+/**
+ * The ten fields the Section 1 completeness gate counts. Only `asking_price`
+ * used to survive the old allowlist, which made the "fewer than 5 financial
+ * fields" rule unsatisfiable no matter how complete the submission was.
+ */
+export const FINANCIAL_GATE_FIELDS = [
+  'asking_price',
+  'estimated_value',
+  'monthly_rent_actual',
+  'monthly_rent_market',
+  'annual_noi',
+  'cap_rate',
+  'mortgage_balance',
+  'seller_equity_pct',
+  'rehab_estimate',
+  'cash_flow_per_door',
+] as const;
+
+/** Fields always rendered in the payload, as a value or as MISSING. */
+export const CANONICAL_DEAL_FIELDS: readonly string[] = [
+  // Identity and provenance
+  'property_address', 'asset_class', 'property_type', 'geography', 'market', 'state',
+  'deal_source', 'submitter', 'submitter_name', 'submitter_email', 'submission_date',
+  // Physical characteristics
+  'unit_count', 'bedrooms', 'bathrooms', 'sqft', 'lot_size', 'year_built',
+  'condition', 'occupancy_status', 'occupancy_rate', 'lease_terms',
+  // Financial — the Section 1 gate set
+  ...FINANCIAL_GATE_FIELDS,
+  // Financial — everything else a real deal carries
+  'arv', 'repair_estimate', 'purchase_price', 'property_taxes', 'insurance_estimate',
+  'hoa_fees', 'revenue_current', 'operating_expenses', 'financing_terms',
+  'seller_motivation', 'motivation_level', 'timeline',
+  // Free text
+  'notes', 'additional_notes',
+];
+
+/**
+ * Older callers (and PAE-W2 before this change) use different names for fields
+ * the gate counts. An alias fills its canonical target only when that target is
+ * absent; both keys stay in the payload so nothing is rewritten under the model.
+ */
+export const FIELD_ALIASES: Readonly<Record<string, string>> = {
+  arv: 'estimated_value',
+  repair_estimate: 'rehab_estimate',
+  purchase_price: 'asking_price',
+  motivation_level: 'seller_motivation',
+  submitter_name: 'submitter',
+  notes: 'additional_notes',
+  market: 'geography',
+};
+
+/** Routing/plumbing keys — part of the request, not part of the deal. */
+export const CONTROL_KEYS: ReadonlySet<string> = new Set([
+  'opportunity_id', 'opportunityId',
+  'contact_id', 'contactId',
+  'location_id', 'locationId',
+  'workflow_id', 'workflowId',
+  'request_id', 'requestId',
+]);
+
+/** Bounds on caller-supplied extras, so pass-through cannot blow up the prompt. */
+const MAX_EXTRA_FIELDS = 60;
+const MAX_VALUE_LEN = 2000;
+
+function normaliseValue(raw: unknown): string | null {
+  if (raw === null || raw === undefined) return null;
+  if (Array.isArray(raw)) {
+    const joined = raw.map((x) => String(x)).join(', ').trim();
+    return joined ? joined.slice(0, MAX_VALUE_LEN) : null;
+  }
+  if (typeof raw === 'object') {
+    const s = JSON.stringify(raw);
+    return s && s !== '{}' ? s.slice(0, MAX_VALUE_LEN) : null;
+  }
+  const s = String(raw).trim();
+  if (!s) return null;
+  // An unresolved GHL merge token is absence, not data.
+  if (s.includes('{{') && s.includes('}}')) return null;
+  if (/^(MISSING|null|undefined|N\/A)$/i.test(s)) return null;
+  return s.slice(0, MAX_VALUE_LEN);
+}
+
+export interface ProjectedDeal {
+  /** Canonical fields (value or 'MISSING') plus any caller-supplied extras. */
+  dealData: Record<string, string>;
+  /** Which of the Section 1 gate fields actually arrived with a value. */
+  financialFieldsPresent: string[];
+  /** Non-canonical keys the caller sent that were carried through. */
+  extraFields: string[];
+  /** Extras dropped because MAX_EXTRA_FIELDS was hit. */
+  droppedFields: string[];
+}
+
+/**
+ * Project a request body into the deal payload handed to the model.
+ *
+ * Canonical fields always appear (as MISSING when absent) so the model can see
+ * what it does not have. Everything else the caller sent is carried through up
+ * to a bound, so a new intake field reaches the analysis without a code change.
+ */
+export function projectDealPayload(body: unknown): ProjectedDeal {
+  const input: Record<string, unknown> =
+    body && typeof body === 'object' && !Array.isArray(body)
+      ? (body as Record<string, unknown>)
+      : {};
+
+  const values: Record<string, string> = {};
+  for (const [key, raw] of Object.entries(input)) {
+    if (CONTROL_KEYS.has(key)) continue;
+    const v = normaliseValue(raw);
+    if (v !== null) values[key] = v;
+  }
+
+  // Fill canonical targets from aliases only where the target is absent.
+  for (const [alias, target] of Object.entries(FIELD_ALIASES)) {
+    if (values[alias] !== undefined && values[target] === undefined) {
+      values[target] = values[alias];
+    }
+  }
+
+  const dealData: Record<string, string> = {};
+  for (const field of CANONICAL_DEAL_FIELDS) {
+    dealData[field] = values[field] ?? 'MISSING';
+  }
+
+  const extraFields: string[] = [];
+  const droppedFields: string[] = [];
+  for (const key of Object.keys(values)) {
+    if (dealData[key] !== undefined) continue;
+    if (extraFields.length >= MAX_EXTRA_FIELDS) {
+      droppedFields.push(key);
+      continue;
+    }
+    extraFields.push(key);
+    dealData[key] = values[key];
+  }
+
+  const financialFieldsPresent = FINANCIAL_GATE_FIELDS.filter(
+    (f) => values[f] !== undefined
+  ).slice();
+
+  return { dealData, financialFieldsPresent, extraFields, droppedFields };
+}
+
+/** Stable, human-readable request id that ties an acknowledgement to a card. */
+export function makeRequestId(now: Date = new Date()): string {
+  const p = (n: number, w = 2) => String(n).padStart(w, '0');
+  const stamp =
+    `${now.getUTCFullYear()}${p(now.getUTCMonth() + 1)}${p(now.getUTCDate())}` +
+    `-${p(now.getUTCHours())}${p(now.getUTCMinutes())}${p(now.getUTCSeconds())}`;
+  return `PAE-${stamp}-${randomUUID().slice(0, 8)}`;
+}
+
+/**
+ * Build the user message for one analysis.
+ *
+ * The financial-field count is computed here rather than left to the model to
+ * count for itself, so the Section 1 gate is deterministic and auditable.
+ */
+export function buildUserMessage(projected: ProjectedDeal): string {
+  const { dealData, financialFieldsPresent } = projected;
+  return (
+    'Analyze the following real estate deal opportunity. Return your analysis as a single JSON object ' +
+    'following the schema defined in your system prompt. Do not include any text outside the JSON object.\n\n' +
+    'IMPORTANT: Keep ALL string/notes/reasoning fields concise — maximum 2 sentences each. Do not write ' +
+    'verbose calculations or multi-paragraph explanations inside JSON string values. Use numeric fields for numbers.\n\n' +
+    'ENGINE-COMPUTED DATA COMPLETENESS (authoritative — use these counts for the Section 1 financial gate ' +
+    'instead of counting the fields yourself):\n' +
+    `  financial_fields_present (${financialFieldsPresent.length} of ${FINANCIAL_GATE_FIELDS.length}): ` +
+    (financialFieldsPresent.length ? financialFieldsPresent.join(', ') : 'none') +
+    '\n' +
+    `  financial_gate_satisfied: ${financialFieldsPresent.length >= 5}\n\n` +
+    'DEAL DATA:\n' +
+    JSON.stringify(dealData, null, 2)
+  );
+}
+
 // ── Route Registration ────────────────────────────────────────────────────────
+
+/** How long the caller is told to expect the analysis to take. */
+const ESTIMATED_COMPLETION_SECONDS = 60;
 
 export function registerPAERoutes(app: Application, log: LogFn): void {
   const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
@@ -1060,242 +1272,291 @@ export function registerPAERoutes(app: Application, log: LogFn): void {
   }
   const PAE_SECRET = process.env.PAE_WEBHOOK_SECRET;
 
-  app.post('/pae/analyze', async (req: Request, res: Response) => {
-    const startTs = Date.now();
-    log('info', 'PAE /analyze request received');
+  /**
+   * Record a terminal failure on the card so the workflow — and Steven — can
+   * see that the analysis did not complete, rather than reading an empty
+   * verdict as a legitimate PASS.
+   */
+  async function markFailed(
+    opportunityId: string,
+    requestId: string,
+    message: string
+  ): Promise<void> {
+    const status: AnalysisStatus = 'FAILED';
+    const write = await writeAnalysisFields(
+      opportunityId,
+      {
+        status,
+        error: message,
+        requestId,
+        pipelineRoute: 'UNROUTED',
+        analysisTimestamp: new Date().toISOString(),
+      },
+      log
+    );
+    if (!write.ok) {
+      log('error', 'PAE /analyze: could not record failure on opportunity', {
+        opportunityId,
+        requestId,
+        failure: message,
+        writeError: write.error,
+      });
+    }
+  }
 
+  /**
+   * The analysis itself. Runs after the acknowledgement has been sent, so it
+   * must never throw into the request cycle and must record its own outcome.
+   */
+  async function runAnalysis(
+    opportunityId: string,
+    requestId: string,
+    projected: ProjectedDeal
+  ): Promise<void> {
+    const startTs = Date.now();
+
+    const analyzing: AnalysisStatus = 'ANALYZING';
+    const claim = await writeAnalysisFields(
+      opportunityId,
+      {
+        status: analyzing,
+        requestId,
+        analysisTimestamp: new Date().toISOString(),
+        error: '',
+      },
+      log
+    );
+    if (!claim.ok) {
+      // The card cannot be written at all. Nothing downstream will show a
+      // verdict; the card keeps whatever PAE-W2 stamped and the router's
+      // catch-all notifies. Log loudly — this is the one failure we cannot make
+      // visible in GHL by writing to GHL.
+      log('error', 'PAE /analyze: opportunity is not writable; analysis abandoned', {
+        opportunityId,
+        requestId,
+        error: claim.error,
+      });
+      return;
+    }
+
+    try {
+      // Load waterfall buyer profiles and append them to the system prompt.
+      // Fail-soft: loadBuyerProfiles never throws. With no profiles the prompt
+      // is byte-identical to the sovereign-only form and Profile 001 still runs.
+      const profileLoad = await loadBuyerProfiles(log);
+      const systemPrompt = SYSTEM_PROMPT + renderProfiles(profileLoad.profiles);
+      if (profileLoad.degradedReason) {
+        log('warn', 'PAE /analyze: profile load degraded', {
+          reason: profileLoad.degradedReason,
+          source: profileLoad.source,
+        });
+      }
+
+      const response = await callClaudeAPI(ANTHROPIC_API_KEY as string, {
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 5500,
+        system: systemPrompt,
+        messages: [{ role: 'user', content: buildUserMessage(projected) }],
+      });
+
+      if (response.statusCode !== 200) {
+        await markFailed(
+          opportunityId,
+          requestId,
+          `Claude API returned status ${response.statusCode}: ` +
+            JSON.stringify(response.body).slice(0, 500)
+        );
+        return;
+      }
+
+      const claudeText: string | undefined = (response.body as any)?.content?.[0]?.text;
+      if (!claudeText) {
+        await markFailed(opportunityId, requestId, 'Claude API returned no text content');
+        return;
+      }
+
+      let analysis: any;
+      try {
+        const trimmed = claudeText
+          .trim()
+          .replace(/^```(?:json)?\s*/i, '')
+          .replace(/\s*```$/, '');
+        analysis = JSON.parse(trimmed);
+      } catch (parseErr: any) {
+        await markFailed(
+          opportunityId,
+          requestId,
+          `Failed to parse Claude response: ${parseErr.message}. First 500 chars: ` +
+            claudeText.slice(0, 500)
+        );
+        return;
+      }
+
+      const sovereign = (analysis.sovereign_evaluation || {}) as any;
+      const verdict = (analysis.verdict || {}) as any;
+      const inputSummary = (analysis.input_summary || {}) as any;
+
+      const decision =
+        typeof verdict.decision === 'string' ? verdict.decision.trim().toUpperCase() : '';
+
+      if (!decision) {
+        await markFailed(
+          opportunityId,
+          requestId,
+          'Analysis returned no verdict.decision; nothing to route on'
+        );
+        return;
+      }
+
+      const complete: AnalysisStatus = 'COMPLETE';
+      const values: ResultValues = {
+        status: complete,
+        verdict: decision,
+        pipelineRoute: derivePipelineRoute(decision),
+        compositeScore: Number(sovereign.composite_score ?? 0) || 0,
+        reasoning: String(verdict.reasoning ?? sovereign.reasoning ?? ''),
+        keyRisks: ((verdict.key_risks || sovereign.key_risks || []) as string[]).join(' | '),
+        dataCompleteness: Number(inputSummary.data_completeness_pct ?? 0) || 0,
+        analysisTimestamp: String(analysis.analysis_timestamp ?? new Date().toISOString()),
+        requestId,
+        error: '',
+      };
+
+      const write = await writeAnalysisFields(opportunityId, values, log);
+      if (!write.ok) {
+        log('error', 'PAE /analyze: verdict could not be written back', {
+          opportunityId,
+          requestId,
+          verdict: decision,
+          error: write.error,
+          unresolved: write.unresolved,
+        });
+        return;
+      }
+
+      log('info', 'PAE /analyze: completed', {
+        opportunityId,
+        requestId,
+        verdict: decision,
+        pipelineRoute: values.pipelineRoute,
+        compositeScore: values.compositeScore,
+        profilesLoaded: profileLoad.profiles.length,
+        elapsedMs: Date.now() - startTs,
+      });
+    } catch (err: any) {
+      await markFailed(
+        opportunityId,
+        requestId,
+        `Analysis threw: ${err?.message ?? 'unknown error'}`
+      );
+    }
+  }
+
+  app.post('/pae/analyze', (req: Request, res: Response) => {
     // 1. Auth
     if (PAE_SECRET) {
       const provided = req.headers['x-pae-secret'];
       if (provided !== PAE_SECRET) {
         log('warn', 'PAE /analyze: unauthorized');
-        res.status(401).json({ error: 'Unauthorized' });
+        res
+          .status(401)
+          .json({ error: true, error_type: 'UNAUTHORIZED', error_message: 'Unauthorized' });
         return;
       }
     }
 
-    // 2. Build deal data from request body
-    const inputData: Record<string, string> = req.body || {};
-    const dealData = {
-      property_address:  inputData['property_address']  || 'MISSING',
-      asking_price:      inputData['asking_price']       || 'MISSING',
-      arv:               inputData['arv']                || 'MISSING',
-      repair_estimate:   inputData['repair_estimate']    || 'MISSING',
-      deal_source:       inputData['deal_source']        || 'MISSING',
-      asset_class:       inputData['asset_class']        || 'MISSING',
-      market:            inputData['market']             || 'MISSING',
-      state:             inputData['state']              || 'MISSING',
-      submitter_name:    inputData['submitter_name']     || 'MISSING',
-      submitter_email:   inputData['submitter_email']    || 'MISSING',
-      notes:             inputData['notes']              || 'MISSING',
-      property_type:     inputData['property_type']      || 'MISSING',
-      bedrooms:          inputData['bedrooms']           || 'MISSING',
-      bathrooms:         inputData['bathrooms']          || 'MISSING',
-      sqft:              inputData['sqft']               || 'MISSING',
-      year_built:        inputData['year_built']         || 'MISSING',
-      lot_size:          inputData['lot_size']           || 'MISSING',
-      occupancy_status:  inputData['occupancy_status']   || 'MISSING',
-      motivation_level:  inputData['motivation_level']   || 'MISSING',
-      timeline:          inputData['timeline']           || 'MISSING',
-    };
+    const body = (req.body || {}) as Record<string, unknown>;
+    const requestId = makeRequestId();
 
-    // 3. Build user message
-    const userMessage =
-      'Analyze the following real estate deal opportunity. Return your analysis as a single JSON object following the schema defined in your system prompt. Do not include any text outside the JSON object.\n\nIMPORTANT: Keep ALL string/notes/reasoning fields concise — maximum 2 sentences each. Do not write verbose calculations or multi-paragraph explanations inside JSON string values. Use numeric fields for numbers.\n\nDEAL DATA:\n' +
-      JSON.stringify(dealData, null, 2);
+    // 2. Validate. Every failure here is synchronous and reaches GHL as a
+    //    non-2xx webhook response, which marks the action failed in the run log
+    //    instead of letting the deal continue with no analysis behind it.
+    const rawOpportunityId = body['opportunity_id'] ?? body['opportunityId'];
+    if (!isUsableGhlId(rawOpportunityId)) {
+      log('warn', 'PAE /analyze: missing or unresolved opportunity_id', {
+        requestId,
+        received: String(rawOpportunityId ?? ''),
+      });
+      res.status(400).json({
+        status: 'rejected',
+        error: true,
+        error_type: 'VALIDATION_ERROR',
+        error_message:
+          'opportunity_id is required and must be a resolved GHL opportunity id. ' +
+          'In PAE-W2 this is {{opportunity.id}}, which only resolves once an ' +
+          'opportunity has been created earlier in the workflow.',
+        request_id: requestId,
+        received_opportunity_id: String(rawOpportunityId ?? ''),
+      });
+      return;
+    }
+    const opportunityId = String(rawOpportunityId).trim();
 
-    // 4. Call Claude
     if (!ANTHROPIC_API_KEY) {
       res.status(500).json({
+        status: 'rejected',
         error: true,
         error_type: 'CONFIG_ERROR',
         error_message: 'ANTHROPIC_API_KEY environment variable is not configured on the server',
-        verdict: 'ERROR',
-        email_notification: true,
-        pipeline_route: 'DEFAULT',
+        request_id: requestId,
+        opportunity_id: opportunityId,
       });
       return;
     }
 
-    let apiResult: any;
-    try {
-      const response = await callClaudeAPI(ANTHROPIC_API_KEY, {
-        model: 'claude-haiku-4-5-20251001',
-        max_tokens: 5500,
-        system: SYSTEM_PROMPT,
-        messages: [{ role: 'user', content: userMessage }],
-      });
-
-      if (response.statusCode !== 200) {
-        log('error', 'PAE /analyze: Claude API error', { status: response.statusCode });
-        res.status(502).json({
-          error: true,
-          error_type: 'API_ERROR',
-          error_message: 'Claude API returned status ' + response.statusCode,
-          error_details: JSON.stringify(response.body),
-          verdict: 'ERROR',
-          email_notification: true,
-          pipeline_route: 'DEFAULT',
-        });
-        return;
-      }
-      apiResult = response.body;
-    } catch (httpErr: any) {
-      log('error', 'PAE /analyze: Claude API unreachable', { error: httpErr.message });
-      res.status(502).json({
+    if (!process.env.GHL_API_KEY || !process.env.GHL_LOCATION_ID) {
+      // Without these the result has nowhere to go. Fail at the webhook rather
+      // than accept work whose output would vanish.
+      res.status(500).json({
+        status: 'rejected',
         error: true,
-        error_type: 'FETCH_ERROR',
-        error_message: 'Failed to reach Claude API: ' + httpErr.message,
-        verdict: 'ERROR',
-        email_notification: true,
-        pipeline_route: 'DEFAULT',
+        error_type: 'CONFIG_ERROR',
+        error_message:
+          'GHL_API_KEY and GHL_LOCATION_ID must be configured; results are written ' +
+          'back to the opportunity and cannot be returned in this response',
+        request_id: requestId,
+        opportunity_id: opportunityId,
       });
       return;
     }
 
-    // 5. Extract and parse Claude response
-    const claudeText: string | undefined = (apiResult as any)?.content?.[0]?.text;
-    if (!claudeText) {
-      res.status(502).json({
-        error: true,
-        error_type: 'EMPTY_RESPONSE',
-        error_message: 'Claude API returned no text content',
-        raw_response: JSON.stringify(apiResult),
-        verdict: 'ERROR',
-        email_notification: true,
-        pipeline_route: 'DEFAULT',
-      });
-      return;
-    }
+    // 3. Project the payload before acknowledging, so a malformed body is
+    //    rejected rather than accepted and then dropped in the background.
+    const projected = projectDealPayload(body);
 
-    let analysis: any;
-    try {
-      // Strip markdown code fences if present
-      const trimmed = claudeText.trim()
-        .replace(/^```(?:json)?\s*/i, '')
-        .replace(/\s*```$/, '');
-      analysis = JSON.parse(trimmed);
-    } catch (parseErr: any) {
-      res.status(502).json({
-        error: true,
-        error_type: 'PARSE_ERROR',
-        error_message: 'Failed to parse Claude response: ' + parseErr.message,
-        raw_response: claudeText.substring(0, 2000),
-        verdict: 'ERROR',
-        email_notification: true,
-        pipeline_route: 'DEFAULT',
-      });
-      return;
-    }
-
-    // 6. Build structured output
-    const sovereign     = (analysis.sovereign_evaluation        || {}) as any;
-    const waterfallRecs = (analysis.waterfall_recommendations   || []) as any[];
-    const consolidated  = (analysis.consolidated_recommendation || {}) as any;
-    const verdict       = (analysis.verdict                     || {}) as any;
-    const inputSummary  = (analysis.input_summary               || {}) as any;
-    const reviewDetails = (analysis.review_details              || {}) as any;
-    const brrrrAnalysis = (analysis.brrrr_analysis              || {}) as any;
-    const feeStructure  = (analysis.fee_structure               || {}) as any;
-    const economics     = (verdict.estimated_deal_economics      || {}) as any;
-
-    log('info', 'PAE /analyze: completed', {
-      verdict: verdict.decision,
-      elapsed: Date.now() - startTs,
+    log('info', 'PAE /analyze: accepted', {
+      requestId,
+      opportunityId,
+      financialFields: projected.financialFieldsPresent.length,
+      extraFields: projected.extraFields.length,
+      droppedFields: projected.droppedFields.length,
     });
 
-    res.json({
-      // Primary routing
-      verdict:            verdict.decision ?? 'ERROR',
-      email_notification: verdict.email_notification !== undefined ? verdict.email_notification : true,
-
-      // Deal identification
-      deal_id:            analysis.deal_id          ?? 'UNKNOWN',
-      engine_version:     analysis.engine_version   ?? '1.3',
-      analysis_timestamp: analysis.analysis_timestamp ?? new Date().toISOString(),
-
-      // Property info
-      property_address: inputSummary.property_address ?? dealData.property_address,
-      asset_class:      inputSummary.asset_class      ?? dealData.asset_class,
-      deal_source:      inputSummary.deal_source      ?? dealData.deal_source,
-      submitter:        inputSummary.submitter        ?? dealData.submitter_name,
-      submitter_email:  dealData.submitter_email,
-
-      // Scoring
-      composite_score:    sovereign.composite_score    ?? 0,
-      geography_score:    sovereign.geography_score    ?? 0,
-      asset_class_score:  sovereign.asset_class_score  ?? 0,
-      financial_score:    sovereign.financial_score    ?? 0,
-      strategy_fit_score: sovereign.strategy_fit_score ?? 0,
-      motivation_score:   sovereign.motivation_score   ?? 0,
-      match_result:       sovereign.match_result       ?? 'NO_MATCH',
-
-      // Verdict details
-      matched_profile_id:   verdict.matched_profile_id   ?? '',
-      matched_profile_name: verdict.matched_profile_name ?? '',
-      confidence:           verdict.confidence            ?? 'LOW',
-      reasoning:            verdict.reasoning             ?? '',
-      recommended_strategy: verdict.recommended_strategy ?? '',
-      key_strengths: ((verdict.key_strengths   || []) as string[]).join(' | '),
-      key_risks:     ((verdict.key_risks       || []) as string[]).join(' | '),
-      next_steps:    ((verdict.next_steps      || []) as string[]).join(' | '),
-
-      // Economics
-      projected_monthly_cashflow:    economics.projected_monthly_cashflow    ?? 0,
-      projected_cash_on_cash_return: economics.projected_cash_on_cash_return ?? 0,
-      estimated_equity_position:     economics.estimated_equity_position     ?? 0,
-      estimated_assignment_fee:      economics.estimated_assignment_fee      ?? 0,
-      cap_rate_assessed:             economics.cap_rate_assessed             ?? 0,
-      monetary_value: verdict.decision === 'WHOLESALE'
-        ? (economics.estimated_assignment_fee  ?? 0)
-        : (economics.estimated_equity_position ?? 0),
-
-      // Data quality
-      data_completeness_pct: inputSummary.data_completeness_pct ?? 0,
-      missing_fields: ((inputSummary.missing_fields || []) as string[]).join(', '),
-
-      // REVIEW-specific
-      review_priority:         reviewDetails.review_priority         ?? '',
-      missing_fields_critical: ((reviewDetails.missing_fields_critical || []) as string[]).join(', '),
-      verdict_if_favorable:    reviewDetails.verdict_if_favorable    ?? '',
-      verdict_if_unfavorable:  reviewDetails.verdict_if_unfavorable  ?? '',
-      follow_up_actions:       ((reviewDetails.follow_up_actions     || []) as string[]).join(' | '),
-      missing_data_impact:     verdict.missing_data_impact           ?? '',
-
-      // BRRRR
-      brrrr_triggered:     brrrrAnalysis.triggered    ?? false,
-      brrrr_viable:        brrrrAnalysis.brrrr_viable  ?? false,
-      brrrr_forced_equity: brrrrAnalysis.forced_equity ?? 0,
-
-      // Fee structure
-      fee_applicable: feeStructure.applicable    ?? false,
-      fee_type:       feeStructure.fee_type       ?? '',
-      estimated_fee:  feeStructure.estimated_fee  ?? 0,
-
-      // Two-layer fields
-      sovereign_score:        sovereign.composite_score                                      ?? 0,
-      sovereign_verdict:      sovereign.verdict                                              ?? '',
-      sovereign_reasoning:    sovereign.reasoning                                            ?? '',
-      top_rec_profile:        waterfallRecs[0]?.profile_name             ?? 'None',
-      top_rec_score:          waterfallRecs[0]?.weighted_composite_score ?? 0,
-      primary_path:           consolidated.primary_path                  ?? '',
-      partnership_flag:       consolidated.partnership_recommended       ?? false,
-      partnership_notes:      consolidated.partnership_notes             ?? '',
-      consolidated_reasoning: consolidated.reasoning                     ?? '',
-
-      pipeline_route: 'DEFAULT',
-      full_analysis_json: JSON.stringify(analysis),
-      opportunity_name: (
-        (inputSummary.property_address || dealData.property_address || 'Unknown Property')
-          .substring(0, 60) + ' — ' + (verdict.decision ?? 'ERROR')
-      ),
-
-      // Error tracking (success path)
+    // 4. Acknowledge. 200 rather than 202 because GHL's custom-webhook action
+    //    treats a status it does not recognise as a failed step.
+    res.status(200).json({
+      status: 'accepted',
+      request_id: requestId,
+      opportunity_id: opportunityId,
+      accepted_at: new Date().toISOString(),
+      estimated_completion_seconds: ESTIMATED_COMPLETION_SECONDS,
+      // Deliberately carries NO verdict. Routing reads the opportunity custom
+      // fields named below once the analysis lands.
+      result_fields: RESULT_FIELDS,
+      financial_fields_present: projected.financialFieldsPresent,
+      extra_fields_forwarded: projected.extraFields,
+      dropped_fields: projected.droppedFields,
+      note:
+        'Analysis runs asynchronously. Read the opportunity custom fields in ' +
+        'result_fields; paew2_status becomes COMPLETE or FAILED when it finishes.',
       error: false,
-      error_type: '',
-      error_message: '',
+    });
+
+    // 5. Run the analysis after the response is on the wire.
+    setImmediate(() => {
+      void runAnalysis(opportunityId, requestId, projected);
     });
   });
 
-  log('info', 'PAE routes registered: POST /pae/analyze');
+  log('info', 'PAE routes registered: POST /pae/analyze (asynchronous write-back)');
 }

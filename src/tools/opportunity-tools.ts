@@ -239,6 +239,22 @@ export class OpportunityTools {
               type: 'string',
               description: 'Updated assigned user ID'
             },
+            customFields: {
+              type: 'array',
+              description:
+                'Opportunity custom field values to write. Each entry is ' +
+                '{ id: <custom field ID>, field_value: <value> }. Get IDs from ' +
+                'get_location_custom_fields with model "opportunity".',
+              items: {
+                type: 'object',
+                properties: {
+                  id: { type: 'string', description: 'Custom field ID' },
+                  key: { type: 'string', description: 'Custom field key (alternative to id)' },
+                  field_value: { description: 'Value to write' },
+                },
+                required: ['field_value'],
+              },
+            },
           },
           required: ['opportunityId']
         },
@@ -589,6 +605,10 @@ export class OpportunityTools {
       if (params.status) updateData.status = params.status;
       if (params.monetaryValue !== undefined) updateData.monetaryValue = params.monetaryValue;
       if (params.assignedTo) updateData.assignedTo = params.assignedTo;
+      // customFields was declared on the params type and forwarded by
+      // create_opportunity, but this "full update" path silently dropped it —
+      // callers got a success response and no field written.
+      if (params.customFields) updateData.customFields = params.customFields;
 
       const response = await this.ghlClient.updateOpportunity(params.opportunityId, updateData);
       

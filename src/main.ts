@@ -26,6 +26,7 @@ import { GHLConfig } from './types/ghl-types.js';
 import { registerExecuteRoutes } from './execute-route.js';
 import { registerPAERoutes } from './pae-handler.js';
 import { registerCommsRoutes } from './comms-open-status.js';
+import { BUILD_INFO } from './build-info.js';
 
 import { randomUUID } from 'node:crypto';
 import {
@@ -444,6 +445,13 @@ app.delete('/mcp', async (req, res) => {
       status: 'healthy',
       server: 'ghl-mcp-server',
       version: '2.0.0',
+      // Which commit this build came from. A deployed build was once found to be
+      // older than source with no way to tell; this is how a deploy gets verified
+      // rather than assumed. `commit_source` names where the SHA came from —
+      // RAILWAY_GIT_COMMIT_SHA in production, 'unavailable' if nothing set it.
+      commit: BUILD_INFO.commit,
+      commit_short: BUILD_INFO.commitShort,
+      commit_source: BUILD_INFO.commitSource,
       uptime: Math.floor((Date.now() - startTime) / 1000),
       timestamp: new Date().toISOString(),
       tools: totalTools,

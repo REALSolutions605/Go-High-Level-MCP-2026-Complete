@@ -398,6 +398,16 @@ export class WorkflowBuilderClient {
       actions?: WorkflowAction[];
       triggers?: WorkflowTrigger[];
       deletedSteps?: string[];
+      /**
+       * GHL's "Allow Multiple Opportunities" setting. With this false, a
+       * `create_opportunity` action UPDATES the contact's existing opportunity
+       * in the pipeline instead of creating a new one — four submissions from
+       * one bird-dog collapse into a single card, each silently renaming the
+       * last. Omit to preserve the workflow's current value.
+       */
+      allowMultipleOpportunity?: boolean;
+      /** Workflow re-entry setting. Omit to preserve the current value. */
+      allowMultiple?: boolean;
     }
   ): Promise<WorkflowFull> {
     const unsupported = WorkflowBuilderClient.triggerCreateUnsupported(update.triggers);
@@ -420,6 +430,20 @@ export class WorkflowBuilderClient {
       ? actions.map(a => a.id).filter((id): id is string => !!id)
       : [];
 
+    // Workflow-level settings were previously hardcoded here, so every save
+    // silently reset whatever the workflow had configured in the UI. They are
+    // now carried through from the current document unless explicitly changed.
+    const bool = (
+      override: boolean | undefined,
+      currentValue: unknown,
+      fallback: boolean
+    ): boolean =>
+      override !== undefined
+        ? override
+        : typeof currentValue === 'boolean'
+          ? currentValue
+          : fallback;
+
     const body = {
       name: update.name || current.name,
       isRestoreRequest: true,
@@ -427,11 +451,15 @@ export class WorkflowBuilderClient {
       version: current.version,
       dataVersion: current.dataVersion,
       timezone: current.timezone || 'account',
-      stopOnResponse: false,
-      allowMultiple: false,
-      allowMultipleOpportunity: false,
-      autoMarkAsRead: false,
-      removeContactFromLastStep: true,
+      stopOnResponse: bool(undefined, current.stopOnResponse, false),
+      allowMultiple: bool(update.allowMultiple, current.allowMultiple, false),
+      allowMultipleOpportunity: bool(
+        update.allowMultipleOpportunity,
+        current.allowMultipleOpportunity,
+        false
+      ),
+      autoMarkAsRead: bool(undefined, current.autoMarkAsRead, false),
+      removeContactFromLastStep: bool(undefined, current.removeContactFromLastStep, true),
       workflowData: { templates: actions },
       updatedBy: this.config.userId,
       oldTriggers: [],

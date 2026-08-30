@@ -1,5 +1,41 @@
 # 🚀 Cloud Deployment Guide - ChatGPT Integration
 
+## 📍 This project's live deployment
+
+**Production host: `https://ghlmcp.real-solutions-llc.com`**
+
+Railway auto-deploys `main`. Every URL below that says `your-app-name.railway.app`
+is a generic placeholder from the original guide — for THIS deployment, use the
+host above.
+
+| Endpoint | Purpose |
+|---|---|
+| `https://ghlmcp.real-solutions-llc.com/health` | Liveness + **the commit SHA the running build came from** |
+| `https://ghlmcp.real-solutions-llc.com/mcp` | MCP Streamable HTTP |
+| `https://ghlmcp.real-solutions-llc.com/sse` | MCP legacy SSE |
+| `https://ghlmcp.real-solutions-llc.com/tools/call` | REST tool bridge (`{"name":…,"arguments":…}`) |
+| `https://ghlmcp.real-solutions-llc.com/pae/analyze` | Pre-Analysis Engine webhook (PAE-W2) |
+| `https://ghlmcp.real-solutions-llc.com/comms/open-status` | COMMS-W1 verified-send check |
+
+### Verifying a deploy actually landed
+
+Do not assume a push deployed. `/health` reports `commit`, `commit_short` and
+`commit_source`; compare against the commit you pushed:
+
+```bash
+git rev-parse HEAD
+curl -s https://ghlmcp.real-solutions-llc.com/health | grep -o '"commit":"[^"]*"'
+```
+
+`commit_source` should read `RAILWAY_GIT_COMMIT_SHA` in production. If it reads
+`unavailable`, Railway did not inject the SHA and the check cannot be trusted —
+the deployed build was once found to be older than source with no way to tell,
+which is why this field exists.
+
+**GHL location:** `T0EYPXXzbxqjVy81nxnW`
+
+---
+
 ## 🎯 Overview
 
 To connect your GoHighLevel MCP Server to ChatGPT, you need to deploy it to a **publicly accessible URL**. Here are the best options:
