@@ -25,6 +25,7 @@ import { MCPAppsManager } from './apps/index.js';
 import { GHLConfig } from './types/ghl-types.js';
 import { registerExecuteRoutes } from './execute-route.js';
 import { registerPAERoutes } from './pae-handler.js';
+import { registerCommsRoutes } from './comms-open-status.js';
 
 import { randomUUID } from 'node:crypto';
 import {
@@ -176,6 +177,13 @@ async function main() {
   // GHL Custom Webhook action calls POST /pae/analyze with deal data JSON.
   // Uses its own x-pae-secret header auth (PAE_WEBHOOK_SECRET env var).
   registerPAERoutes(app, log);
+
+  // ── COMMS-W1 Open-Status Endpoint (also before the bearer-token guard) ────
+  // The "COMMS-W1 — Verified Send" workflow calls POST /comms/open-status from
+  // a custom_webhook node 48 hours after sending, and routes on the returned
+  // `opened` string. Same x-pae-secret auth (COMMS_WEBHOOK_SECRET, falling back
+  // to PAE_WEBHOOK_SECRET).
+  registerCommsRoutes(app, log);
 
   // Bearer token auth
 const BEARER_TOKEN = process.env.MCP_BEARER_TOKEN;
