@@ -26,6 +26,7 @@ import { GHLConfig } from './types/ghl-types.js';
 import { registerExecuteRoutes } from './execute-route.js';
 import { registerPAERoutes } from './pae-handler.js';
 import { registerCommsRoutes } from './comms-open-status.js';
+import { registerLegalRoutes } from './legal-pages.js';
 import { BUILD_INFO } from './build-info.js';
 
 import { randomUUID } from 'node:crypto';
@@ -185,6 +186,12 @@ async function main() {
   // `opened` string. Same x-pae-secret auth (COMMS_WEBHOOK_SECRET, falling back
   // to PAE_WEBHOOK_SECRET).
   registerCommsRoutes(app, log);
+
+  // ── Public legal pages (also before the bearer-token guard) ────────────
+  // Google fetches /home, /privacy and /terms anonymously while verifying the
+  // "REAL Solutions Lead Gen Monitor" OAuth app, so they must stay above the
+  // guard below.
+  registerLegalRoutes(app);
 
   // Bearer token auth
 const BEARER_TOKEN = process.env.MCP_BEARER_TOKEN;
